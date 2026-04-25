@@ -254,11 +254,44 @@ class AlertRepository:
             )
             conn.commit()
 
+    def delete_incomplete_batches(self) -> List[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT batch_id FROM measurement_batches WHERE status = 'running' ORDER BY started_at"
+            ).fetchall()
+            batch_ids = [row["batch_id"] for row in rows]
+            if not batch_ids:
+                return []
+
+            placeholders = ",".join("?" for _ in batch_ids)
+            conn.execute(
+                f'DELETE FROM onu_measurements WHERE batch_id IN ({placeholders})',
+                batch_ids,
+            )
+            conn.execute(
+                f"DELETE FROM outage_alerts WHERE batch_id IN ({placeholders})",
+                batch_ids,
+            )
+            conn.execute(
+                f"DELETE FROM recovery_alerts WHERE batch_id IN ({placeholders})",
+                batch_ids,
+            )
+            conn.execute(
+                f"DELETE FROM wide_area_alerts WHERE batch_id IN ({placeholders})",
+                batch_ids,
+            )
+            conn.execute(
+                f"DELETE FROM measurement_batches WHERE batch_id IN ({placeholders})",
+                batch_ids,
+            )
+            conn.commit()
+            return batch_ids
+
     def fetch_batch_snapshot_rows(self, batch_id: str) -> List[Dict]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT "Cổng" AS subscriber_key, batch_id, onuStatusStr, accountFiber,
+                SELECT "Cổng" AS subscriber_key, batch_id, onuLastOff, onuLastOn, onuStatusStr, accountFiber,
                        NgayDo, ThoiGianDo
                 FROM onu_measurements
                 WHERE batch_id = ?

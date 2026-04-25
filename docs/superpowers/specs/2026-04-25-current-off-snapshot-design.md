@@ -38,6 +38,13 @@ Add a new current-state snapshot model:
 - Send recurring OFF notifications from the non-suppressed portion of this snapshot, grouped by `doi_vt` and NVKT, on every batch.
 - Export the full snapshot to a single latest JSON file that is overwritten every batch.
 
+Change wide-area detection semantics:
+
+- Do not classify wide-area outages purely by the count of currently OFF subscribers on a port.
+- Instead, detect a same-incident cluster of subscribers on the same port whose `onuLastOff` timestamps fall within a `< 5 minutes` window.
+- Only the subscribers inside the qualifying time cluster are classified as wide-area and suppressed from individual OFF messaging.
+- OFF subscribers on the same port but outside that time cluster remain eligible for individual OFF alerts.
+
 ## Data Model
 
 No new database table is required for the agreed scope.
@@ -57,6 +64,8 @@ Proposed snapshot fields per subscriber:
 - `parent_port_key`
 - `batch_id`
 - `measured_at`
+- `onu_last_off`
+- `onu_last_on`
 - `current_state`
 - `current_status`
 - `ma_tb`
@@ -111,6 +120,7 @@ After processing all rows in a batch:
 - combine current batch snapshot data with the persisted state row
 - use `first_off_time` from `subscriber_state` as the start of the outage window
 - compute `duration_minutes = floor(measured_at - first_off_time)`
+- carry through raw device timestamps `onuLastOff` and `onuLastOn` for downstream analysis
 
 This makes `duration_minutes` cumulative and batch-relative rather than event-relative.
 
@@ -118,7 +128,7 @@ This makes `duration_minutes` cumulative and batch-relative rather than event-re
 
 Keep the current rule order:
 
-1. detect wide-area outages
+1. detect wide-area outages using `onuLastOff` clustering
 2. suppress relevant individual alerts for wide-area
 3. update pattern exclusion table
 4. suppress relevant individual alerts for pattern exclusion
@@ -184,6 +194,27 @@ For recurring individual OFF messages:
 
 `outage_alerts.off_duration_minutes` stays meaningful as the first-event duration at alert creation time for event logging, but is no longer the source for recurring snapshot messaging.
 
+## Wide-Area Detection Rule
+
+Wide-area detection must operate on currently OFF subscribers grouped by `parent_port_key`.
+
+For each port:
+
+- parse `onuLastOff` from the raw measurement payload for each currently OFF subscriber
+- discard rows whose `onuLastOff` is blank or unparsable for the purpose of cluster qualification
+- sort valid timestamps ascending
+- find the largest sliding window where `max(onuLastOff) - min(onuLastOff) < 5 minutes`
+- if that window contains at least `wide_area_threshold` subscribers, create a wide-area alert from exactly that cluster
+- suppress only the clustered subscribers from individual OFF alerting
+- leave OFF subscribers on the same port but outside the cluster unsuppressed
+
+Fallback behavior:
+
+- if no valid `onuLastOff` cluster reaches threshold, do not create a wide-area alert for that port
+- a port with many OFF subscribers but blank or widely scattered `onuLastOff` values is not considered wide-area by this rule
+
+This rule intentionally trades off recall for precision to avoid false positive wide-area incidents caused by unrelated long-running OFF subscribers accumulating on the same port.
+
 ## JSON Snapshot Semantics
 
 The JSON file must contain all currently OFF subscribers, including suppressed records.
@@ -216,6 +247,12 @@ Add a batch snapshot construction phase after state-machine processing and suppr
   - JSON export
 
 The engine should return snapshot counters in the batch result payload for observability.
+
+Wide-area detection in this file must be updated to:
+
+- carry `onuLastOff`/`onuLastOn` in `SubscriberSnapshot`
+- build time-clustered wide-area groups using `onuLastOff`
+- suppress only the clustered subset rather than every OFF subscriber on the same port by default
 
 ### `notification_bridge.py`
 
@@ -283,10 +320,16 @@ Add or update tests to cover:
 - wide-area-suppressed subscriber is present in JSON with suppression flags
 - suppressed subscribers are excluded from recurring individual OFF message payloads
 
-5. grouping behavior
+5. wide-area clustering by `onuLastOff`
+- a port with enough OFF subscribers in a `< 5 minutes` `onuLastOff` cluster produces a wide-area alert
+- only subscribers inside the qualifying cluster are suppressed
+- OFF subscribers on the same port but outside the cluster remain in individual OFF flow
+- a port with many OFF subscribers but blank `onuLastOff` values does not produce a wide-area alert
+
+6. grouping behavior
 - grouping by `doi_vt` and NVKT remains stable for recurring messages
 
-6. JSON contract
+7. JSON contract
 - top-level summary exists
 - subscriber records contain all agreed fields
 

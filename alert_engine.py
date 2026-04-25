@@ -1,3 +1,4 @@
+import os
 from collections import defaultdict
 from datetime import datetime
 from time import perf_counter
@@ -20,6 +21,12 @@ try:
     )
     from .notification_bridge import dispatch_batch_notifications
     from .pattern_exclusion import get_pattern_exclusion_list, update_exclusion_table
+    from .current_off_snapshot import (
+        build_current_off_snapshot,
+        build_snapshot_payload,
+        get_snapshot_output_path,
+        write_snapshot_json,
+    )
 except ImportError:
     from alert_db import AlertRepository
     from doi_vt_mapping import normalize_doi_vt_name
@@ -37,6 +44,12 @@ except ImportError:
     )
     from notification_bridge import dispatch_batch_notifications
     from pattern_exclusion import get_pattern_exclusion_list, update_exclusion_table
+    from current_off_snapshot import (
+        build_current_off_snapshot,
+        build_snapshot_payload,
+        get_snapshot_output_path,
+        write_snapshot_json,
+    )
 
 
 MIN_STABLE_ON_CYCLES = 2
@@ -95,7 +108,19 @@ def _snapshot_from_row(row: Dict, metadata: Dict) -> SubscriberSnapshot:
         dienthoai_lh=(metadata.get("DIENTHOAI_LH") or "").strip(),
         ten_nvkt_db=(metadata.get("TEN_NVKT_DB") or "").strip(),
         account_fiber=(row.get("accountFiber") or "").strip(),
+        onu_last_off=(row.get("onuLastOff") or "").strip(),
+        onu_last_on=(row.get("onuLastOn") or "").strip(),
     )
+
+
+def _parse_device_event_time(value) -> Optional[datetime]:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+    try:
+        return datetime.fromisoformat(raw_value)
+    except ValueError:
+        return None
 
 
 def _base_state(snapshot: SubscriberSnapshot, current_state: str, last_status: str, on_count: int, off_count: int,
@@ -305,7 +330,29 @@ def _detect_wide_area(
     for parent_port_key, snapshots in grouped.items():
         if len(snapshots) <= threshold:
             continue
-        first = snapshots[0]
+        candidates = []
+        for snapshot in snapshots:
+            onu_last_off = _parse_device_event_time(snapshot.onu_last_off)
+            if onu_last_off is None:
+                continue
+            candidates.append((snapshot, onu_last_off))
+        if len(candidates) <= threshold:
+            continue
+
+        candidates.sort(key=lambda item: item[1])
+        best_cluster: List[SubscriberSnapshot] = []
+        left = 0
+        for right, (_snapshot, right_dt) in enumerate(candidates):
+            while left <= right and (right_dt - candidates[left][1]).total_seconds() >= 300:
+                left += 1
+            cluster = [item[0] for item in candidates[left : right + 1]]
+            if len(cluster) > len(best_cluster):
+                best_cluster = cluster
+
+        if len(best_cluster) <= threshold:
+            continue
+
+        first = best_cluster[0]
         port = parent_port_key.split("_", 1)[1] if "_" in parent_port_key else parent_port_key
         alerts.append(
             WideAreaAlert(
@@ -313,15 +360,16 @@ def _detect_wide_area(
                 parent_port_key=parent_port_key,
                 olt_name=first.olt_name,
                 port=port,
-                subscriber_count=len(snapshots),
-                subscriber_keys=[snapshot.subscriber_key for snapshot in snapshots],
+                subscriber_count=len(best_cluster),
+                subscriber_keys=[snapshot.subscriber_key for snapshot in best_cluster],
                 subscriber_list=[
                     {
                         "ma_tb": snapshot.ma_tb,
                         "ten_tb": snapshot.ten_tb,
                         "ten_nvkt_db": snapshot.ten_nvkt_db,
+                        "onu_last_off": snapshot.onu_last_off,
                     }
-                    for snapshot in snapshots
+                    for snapshot in best_cluster
                 ],
                 doi_vt=first.doi_vt,
                 alert_time=first.measured_at,
@@ -412,6 +460,30 @@ def process_completed_batch(
         f"[ALERT] Batch {batch_id}: pattern exclusion updated={pattern_updates} suppressed={len(to_suppress)}",
     )
 
+    state_rows = {
+        snapshot.subscriber_key: repo.get_state_row(snapshot.subscriber_key)
+        for snapshot in current_offs
+    }
+    wide_area_subscriber_keys = {
+        subscriber_key
+        for alert in wide_area_alerts
+        for subscriber_key in alert.subscriber_keys
+    }
+    current_off_snapshot_rows = build_current_off_snapshot(
+        current_offs,
+        state_rows,
+        exclusion_list=exclusion_list,
+        wide_area_subscriber_keys=wide_area_subscriber_keys,
+    )
+    measured_at = max((snapshot.measured_at for snapshot in snapshots), default=None)
+    current_off_snapshot_file = str(get_snapshot_output_path(os.path.dirname(db_path) or "."))
+    current_off_snapshot_payload = build_snapshot_payload(
+        batch_id,
+        measured_at,
+        current_off_snapshot_rows,
+    )
+    write_snapshot_json(current_off_snapshot_payload, current_off_snapshot_file)
+
     notification_results = {}
     if send_notifications:
         _emit(log, f"[ALERT] Batch {batch_id}: dispatching notifications...")
@@ -425,7 +497,8 @@ def process_completed_batch(
         f"{batch_id}: finished: snapshots={len(snapshots)} "
         f"state_rows_processed={processed_count} current_off={len(current_offs)} "
         f"wide_area_created={len(wide_area_alerts)} outage_created={outage_count} "
-        f"recovery_created={recovery_count} duration={duration_seconds}s",
+        f"recovery_created={recovery_count} current_off_snapshot={len(current_off_snapshot_rows)} "
+        f"duration={duration_seconds}s",
     )
     return {
         "batch_id": batch_id,
@@ -439,6 +512,13 @@ def process_completed_batch(
         "wide_area_alerts_created": len(wide_area_alerts),
         "pattern_updates": pattern_updates,
         "pattern_suppressed_count": len(to_suppress),
+        "current_off_snapshot_total": len(current_off_snapshot_rows),
+        "current_off_snapshot_active": sum(
+            1
+            for row in current_off_snapshot_rows
+            if not row["suppressed_by_pattern"] and not row["suppressed_by_wide_area"]
+        ),
+        "current_off_snapshot_file": current_off_snapshot_file,
         "notifications": notification_results,
         "duration_seconds": duration_seconds,
     }

@@ -1,13 +1,18 @@
 import asyncio
+import os
 from datetime import datetime
 from typing import Dict, List
 
 try:
     from .alert_db import AlertRepository
     from . import notification_service
+    from .current_off_snapshot import get_snapshot_output_path, load_snapshot_rows_for_batch
 except ImportError:
     from alert_db import AlertRepository
     import notification_service
+    from current_off_snapshot import get_snapshot_output_path, load_snapshot_rows_for_batch
+
+RECOVERY_NOTIFICATIONS_ENABLED = False
 
 
 def _emit(log, message: str):
@@ -18,8 +23,10 @@ def _emit(log, message: str):
 def _apply_time_filters(alerts: List) -> List:
     filtered = []
     for alert in alerts:
-        first_off_time = alert.first_off_time
-        off_duration_minutes = alert.off_duration_minutes or 0
+        first_off_time = alert.get("first_off_time") if isinstance(alert, dict) else alert.first_off_time
+        off_duration_minutes = (
+            alert.get("duration_minutes", 0) if isinstance(alert, dict) else alert.off_duration_minutes or 0
+        )
         if not first_off_time:
             filtered.append(alert)
             continue
@@ -32,6 +39,11 @@ def _apply_time_filters(alerts: List) -> List:
             continue
         filtered.append(alert)
     return filtered
+
+
+def load_current_off_snapshot_rows(repo: AlertRepository, batch_id: str) -> List[Dict]:
+    snapshot_path = get_snapshot_output_path(os.path.dirname(repo.db_path) or ".")
+    return load_snapshot_rows_for_batch(snapshot_path, batch_id)
 
 
 async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
@@ -162,7 +174,7 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             f"zalo_sent={zalo_sent_count} failed={zalo_failed_count} no_thread={no_thread_count}",
         )
 
-    raw_outage_alerts = repo.list_unsent_outage_alerts(batch_id)
+    raw_outage_alerts = load_current_off_snapshot_rows(repo, batch_id)
     outage_alerts = _apply_time_filters(raw_outage_alerts)
     results["outage"]["raw_pending_alerts"] = len(raw_outage_alerts)
     results["outage"]["filtered_pending_alerts"] = len(outage_alerts)
@@ -177,7 +189,7 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
         telegram_ok = True
         zalo_results = {"sent": 0}
         if config.get("enable_telegram", True):
-            telegram_message = notification_service.format_consolidated_outage_by_nvkt(outage_alerts, for_zalo=False)
+            telegram_message = notification_service.format_current_off_snapshot_by_nvkt(outage_alerts, for_zalo=False)
             telegram_ok = await notification_service.send_telegram_message(telegram_message)
             notification_service.append_notification_delivery_log(
                 {
@@ -187,12 +199,12 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
                     "target_id": config.get("telegram_chat_id", ""),
                     "status": "SUCCESS" if telegram_ok else "FAILED",
                     "message_full": telegram_message,
-                    "alert_ids": [alert.id for alert in outage_alerts if alert.id],
+                    "alert_ids": [],
                     "alert_count": len(outage_alerts),
                 }
             )
         if config.get("enable_zalo", True):
-            zalo_results = await notification_service.send_consolidated_outage_by_doi_vt(outage_alerts)
+            zalo_results = await notification_service.send_current_off_snapshot_by_doi_vt(outage_alerts)
             for delivery in zalo_results.get("deliveries", []):
                 notification_service.append_notification_delivery_log(
                     {
@@ -209,8 +221,9 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
                 "no_thread_groups": zalo_results.get("no_thread", 0),
             }
         )
-        if telegram_ok or zalo_results.get("sent", 0) > 0 or (not config.get("enable_telegram", True) and not config.get("enable_zalo", True)):
-            repo.mark_outage_alerts_sent(alert.id for alert in outage_alerts)
+        if telegram_ok or zalo_results.get("sent", 0) > 0 or (
+            not config.get("enable_telegram", True) and not config.get("enable_zalo", True)
+        ):
             results["outage"]["marked_sent_alerts"] = len(outage_alerts)
         _emit(
             log,
@@ -225,6 +238,9 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     recovery_alerts = repo.list_unsent_recovery_alerts(batch_id)
     results["recovery"]["pending_alerts"] = len(recovery_alerts)
     _emit(log, f"[NOTIFY] Batch {batch_id}: recovery pending={len(recovery_alerts)}")
+    if recovery_alerts and not RECOVERY_NOTIFICATIONS_ENABLED:
+        _emit(log, f"[NOTIFY] Batch {batch_id}: recovery notifications paused")
+        return results
     if recovery_alerts:
         telegram_ok = True
         zalo_results = {"sent": 0}

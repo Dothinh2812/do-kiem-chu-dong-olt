@@ -125,11 +125,18 @@ def _coerce_datetime(value) -> Optional[datetime]:
         return value
     if hasattr(value, "strftime"):
         return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
     return None
 
 
 def _resolve_outage_duration_minutes(obj) -> Optional[int]:
-    explicit_duration = _value(obj, "off_duration_minutes")
+    explicit_duration = _value(obj, "duration_minutes")
+    if explicit_duration is None:
+        explicit_duration = _value(obj, "off_duration_minutes")
     if explicit_duration is None:
         explicit_duration = _value(obj, "outage_duration_minutes")
     if explicit_duration not in (None, ""):
@@ -153,6 +160,14 @@ def _format_outage_duration(obj) -> str:
     if duration_minutes is None:
         return "-"
     return f"{duration_minutes} phút"
+
+
+def _truncate_address(value: str, limit: int = 40) -> str:
+    return (value or "").strip()[:limit] or "-"
+
+
+def _resolve_address(obj) -> str:
+    return _truncate_address(_value(obj, "diachi_lapdat", "") or _value(obj, "diachi_ld", "") or "")
 
 
 def append_notification_delivery_log(entry: Dict, log_file: str = NOTIFICATION_DELIVERY_LOG_FILE) -> None:
@@ -354,17 +369,24 @@ def format_consolidated_outage_for_doi(alerts: List, doi_vt: str) -> str:
         f"Đội: {doi_vt}",
         "",
     ]
-    for idx, alert in enumerate(alerts, 1):
-        ma_tb = _value(alert, "ma_tb", "") or ""
-        ten_tb = _value(alert, "ten_tb", "") or ""
-        sdt = _value(alert, "dienthoai_lh", "") or "-"
-        port_id = _value(alert, "port_id", "") or ""
+    groups = defaultdict(list)
+    for alert in alerts:
         nvkt = _short_nvkt(_value(alert, "ten_nvkt_db", "") or "")
-        lines.append(f"{idx}. [{ma_tb}] {ten_tb} - {sdt}")
-        lines.append(f"   Port: {get_port_display_name(port_id)}")
-        lines.append(f"   Kéo dài: {_format_outage_duration(alert)}")
-        if nvkt:
-            lines.append(f"   NVKT: {nvkt}")
+        groups[nvkt or "Chưa gán NVKT"].append(alert)
+
+    for nvkt, items in groups.items():
+        lines.append(f"👷 {nvkt} ({len(items)} TB)")
+        for idx, alert in enumerate(items, 1):
+            ma_tb = _value(alert, "ma_tb", "") or ""
+            ten_tb = _value(alert, "ten_tb", "") or ""
+            sdt = _value(alert, "dienthoai_lh", "") or "-"
+            dia_chi = _resolve_address(alert)
+            port_id = _value(alert, "port_id", "") or ""
+            lines.append(f"{idx}. [{ma_tb}] {ten_tb} - {sdt}")
+            lines.append(f"   Địa chỉ: {dia_chi}")
+            lines.append(f"   Port: {get_port_display_name(port_id)}")
+            lines.append(f"   Kéo dài: {_format_outage_duration(alert)}")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -490,6 +512,117 @@ async def send_consolidated_outage_by_doi_vt(alerts: List) -> Dict[str, int]:
             }
         )
         time.sleep(0.5)
+
+    if log_entries:
+        log_dir = "log_message"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "zalo_consolidated_outage_log.csv")
+        file_exists = os.path.exists(log_file)
+        with open(log_file, "a", newline="", encoding="utf-8-sig") as handle:
+            fieldnames = ["timestamp", "alert_type", "doi_vt", "alert_count", "thread_id", "status", "error"]
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(log_entries)
+
+    return results
+
+
+def format_current_off_snapshot_by_nvkt(alerts: List, for_zalo: bool = False) -> str:
+    return format_consolidated_outage_by_nvkt(alerts, for_zalo=for_zalo)
+
+
+def format_current_off_snapshot_for_doi(alerts: List, doi_vt: str) -> str:
+    return format_consolidated_outage_for_doi(alerts, doi_vt)
+
+
+async def send_current_off_snapshot_telegram(alerts: List) -> bool:
+    message = format_current_off_snapshot_by_nvkt(alerts, for_zalo=False)
+    if not message:
+        return True
+    return await send_telegram_message(message)
+
+
+async def send_current_off_snapshot_by_doi_vt(alerts: List) -> Dict[str, int]:
+    results = {"sent": 0, "failed": 0, "no_thread": 0, "deliveries": []}
+    groups = defaultdict(list)
+    for alert in alerts:
+        doi_vt = _value(alert, "doi_vt", "") or "Không xác định"
+        groups[doi_vt].append(alert)
+
+    log_entries = []
+    for doi_vt, items in groups.items():
+        thread_id = get_zalo_thread_by_doi_vt(doi_vt)
+        nvkt_groups = defaultdict(list)
+        for alert in items:
+            nvkt = _short_nvkt(_value(alert, "ten_nvkt_db", "") or "")
+            nvkt_groups[nvkt or "Chưa gán NVKT"].append(alert)
+
+        for nvkt_items in nvkt_groups.values():
+            message = format_current_off_snapshot_for_doi(nvkt_items, doi_vt)
+            if not thread_id:
+                results["no_thread"] += 1
+                log_entries.append(
+                    {
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "alert_type": "current_off_snapshot",
+                        "doi_vt": doi_vt,
+                        "alert_count": len(nvkt_items),
+                        "thread_id": "N/A",
+                        "status": "NO_THREAD",
+                        "error": "",
+                    }
+                )
+                results["deliveries"].append(
+                    {
+                        "channel": "zalo",
+                        "alert_type": "outage",
+                        "doi_vt": doi_vt,
+                        "thread_id": "",
+                        "status": "NO_THREAD",
+                        "message_full": message,
+                        "alert_ids": [],
+                        "alert_count": len(nvkt_items),
+                        "error": "DOI_VT not mapped",
+                        "stdout": "",
+                        "stderr": "",
+                        "returncode": None,
+                        "command": [],
+                    }
+                )
+                continue
+            delivery_result = await send_zalo_message_to_thread_detailed(message, thread_id)
+            success = delivery_result["success"]
+            results["sent" if success else "failed"] += 1
+            log_entries.append(
+                {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "alert_type": "current_off_snapshot",
+                    "doi_vt": doi_vt,
+                    "alert_count": len(nvkt_items),
+                    "thread_id": thread_id,
+                    "status": "SUCCESS" if success else "FAILED",
+                    "error": delivery_result.get("error", ""),
+                }
+            )
+            results["deliveries"].append(
+                {
+                    "channel": "zalo",
+                    "alert_type": "outage",
+                    "doi_vt": doi_vt,
+                    "thread_id": thread_id,
+                    "status": "SUCCESS" if success else "FAILED",
+                    "message_full": message,
+                    "alert_ids": [],
+                    "alert_count": len(nvkt_items),
+                    "error": delivery_result.get("error", ""),
+                    "stdout": delivery_result.get("stdout", ""),
+                    "stderr": delivery_result.get("stderr", ""),
+                    "returncode": delivery_result.get("returncode"),
+                    "command": delivery_result.get("command", []),
+                }
+            )
+            time.sleep(0.5)
 
     if log_entries:
         log_dir = "log_message"

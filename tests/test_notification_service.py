@@ -295,6 +295,7 @@ def test_format_consolidated_outage_for_doi_includes_duration_minutes():
                 "ma_tb": "TB001",
                 "ten_tb": "Ten TB",
                 "dienthoai_lh": "0912345678",
+                "diachi_lapdat": "123 Duong Rat Dai, Phuong Trung Tam, Thi Xa Son Tay",
                 "port_id": "1/1/1:1",
                 "ten_nvkt_db": "VNPT - Nguyen Van A",
                 "off_duration_minutes": 15,
@@ -305,6 +306,146 @@ def test_format_consolidated_outage_for_doi_includes_duration_minutes():
 
     assert "Kéo dài: 15 phút" in message
     assert "[TB001] Ten TB - 0912345678" in message
+    assert "👷 Nguyen Van A (1 TB)" in message
+    assert "Địa chỉ: 123 Duong Rat Dai, Phuong Trung Tam, Thi" in message
+
+
+def test_format_consolidated_outage_for_doi_groups_alerts_by_nvkt():
+    message = notification_service.format_consolidated_outage_for_doi(
+        [
+            {
+                "ma_tb": "TB001",
+                "ten_tb": "Ten TB 1",
+                "dienthoai_lh": "0912345678",
+                "diachi_lapdat": "Dia chi so 1, phuong A, son tay",
+                "port_id": "HNI.STY.DGM.OLT.ZT.1.2_1-1-8:17",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "off_duration_minutes": 15,
+            },
+            {
+                "ma_tb": "TB002",
+                "ten_tb": "Ten TB 2",
+                "dienthoai_lh": "0987654321",
+                "diachi_lapdat": "Dia chi so 2, phuong B, son tay",
+                "port_id": "HNI.STY.STY.OLT.AL.2.1_1-1-13:2",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "off_duration_minutes": 18,
+            },
+            {
+                "ma_tb": "TB003",
+                "ten_tb": "Ten TB 3",
+                "dienthoai_lh": "0900000000",
+                "diachi_lapdat": "Dia chi so 3, phuong C, son tay",
+                "port_id": "HNI.STY.STY.OLT.AL.2.1_1-2-11:6",
+                "ten_nvkt_db": "VNPT - Nguyen Van B",
+                "off_duration_minutes": 19,
+            },
+        ],
+        "Sơn Tây",
+    )
+
+    assert "👷 Nguyen Van A (2 TB)" in message
+    assert "👷 Nguyen Van B (1 TB)" in message
+    assert message.index("👷 Nguyen Van A (2 TB)") < message.index("[TB001] Ten TB 1 - 0912345678")
+    assert message.index("👷 Nguyen Van B (1 TB)") < message.index("[TB003] Ten TB 3 - 0900000000")
+
+
+def test_format_current_off_snapshot_for_doi_uses_precomputed_duration():
+    message = notification_service.format_current_off_snapshot_for_doi(
+        [
+            {
+                "ma_tb": "TB001",
+                "ten_tb": "Ten TB",
+                "dienthoai_lh": "0912345678",
+                "diachi_ld": "123 Duong Rat Dai, Phuong Trung Tam, Thi Xa Son Tay",
+                "port_id": "HNI.STY.STY.OLT.AL.2.1_1-1-1:1",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "first_off_time": "2026-04-24T08:10:00",
+                "duration_minutes": 35,
+            }
+        ],
+        "Tổ Kỹ thuật Địa bàn Sơn Tây",
+    )
+
+    assert "🚨 CẢNH BÁO THUÊ BAO OFF" in message
+    assert "Kéo dài: 35 phút" in message
+    assert "[TB001] Ten TB - 0912345678" in message
+
+
+def test_format_current_off_snapshot_by_nvkt_uses_first_off_time_string():
+    message = notification_service.format_current_off_snapshot_by_nvkt(
+        [
+            {
+                "ma_tb": "TB001",
+                "ten_tb": "Ten TB",
+                "dienthoai_lh": "0912345678",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "first_off_time": "2026-04-24T08:10:00",
+                "duration_minutes": 35,
+            }
+        ]
+    )
+
+    assert "TB001 | Ten TB | 0912345678 | 08:10 | 35 phút" in message
+
+
+def test_send_current_off_snapshot_by_doi_vt_splits_messages_by_nvkt(monkeypatch):
+    sent_messages = []
+
+    async def fake_send_zalo_message_to_thread_detailed(message, thread_id, client=None):
+        sent_messages.append((thread_id, message))
+        return {
+            "success": True,
+            "thread_id": thread_id,
+            "message": message,
+            "error": "",
+            "stdout": "",
+            "stderr": "",
+            "returncode": 0,
+            "command": [],
+        }
+
+    monkeypatch.setattr(
+        notification_service,
+        "send_zalo_message_to_thread_detailed",
+        fake_send_zalo_message_to_thread_detailed,
+    )
+
+    result = asyncio.run(
+        notification_service.send_current_off_snapshot_by_doi_vt(
+            [
+                {
+                    "ma_tb": "TB001",
+                    "ten_tb": "Ten TB 1",
+                    "dienthoai_lh": "0912345678",
+                    "diachi_ld": "Dia chi 1",
+                    "port_id": "HNI.STY.STY.OLT.AL.2.1_1-1-1:1",
+                    "doi_vt": "Tổ Kỹ thuật Địa bàn Sơn Tây",
+                    "ten_nvkt_db": "VNPT - Nguyen Van A",
+                    "duration_minutes": 10,
+                    "first_off_time": "2026-04-25T12:00:00",
+                },
+                {
+                    "ma_tb": "TB002",
+                    "ten_tb": "Ten TB 2",
+                    "dienthoai_lh": "0987654321",
+                    "diachi_ld": "Dia chi 2",
+                    "port_id": "HNI.STY.STY.OLT.AL.2.1_1-1-1:2",
+                    "doi_vt": "Tổ Kỹ thuật Địa bàn Sơn Tây",
+                    "ten_nvkt_db": "VNPT - Nguyen Van B",
+                    "duration_minutes": 12,
+                    "first_off_time": "2026-04-25T11:58:00",
+                },
+            ]
+        )
+    )
+
+    assert result["sent"] == 2
+    assert result["failed"] == 0
+    assert len(sent_messages) == 2
+    assert all(thread_id == "4761925886931896176" for thread_id, _message in sent_messages)
+    assert "👷 Nguyen Van A (1 TB)" in sent_messages[0][1]
+    assert "👷 Nguyen Van B (1 TB)" in sent_messages[1][1]
 
 
 def test_format_recovery_message_for_zalo_uses_short_olt_name_in_port(tmp_path, monkeypatch):

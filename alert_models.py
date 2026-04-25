@@ -27,6 +27,8 @@ class SubscriberSnapshot:
     dienthoai_lh: str = ""
     ten_nvkt_db: str = ""
     account_fiber: str = ""
+    onu_last_off: str = ""
+    onu_last_on: str = ""
 
     @property
     def port_id(self) -> str:

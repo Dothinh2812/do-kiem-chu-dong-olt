@@ -32,8 +32,8 @@ MAX_THREADS_PER_DEVICE = 1
 AUTH_RETRY_STATUS_CODES = {401, 403}
 MAX_HTTP_500_RETRIES = 2
 MAX_TIMEOUT_RETRIES = 3
-TIMEOUT_SEQUENCE_SECONDS = [45, 90, 120]
-MEASUREMENT_LOOP_DELAY_SECONDS = 0
+TIMEOUT_SEQUENCE_SECONDS = [15, 30, 60]  # Increasing timeouts for each retry attempt
+MEASUREMENT_LOOP_DELAY_SECONDS = 25
 DATABASE_PATH = "onu_measurements.db"
 SOURCE_DATABASE_PATH = "database.db"
 TABLE_NAME = "onu_measurements"
@@ -862,6 +862,13 @@ def load_tasks():
 
 def main():
     init_database()
+    repo = AlertRepository(DATABASE_PATH, SOURCE_DATABASE_PATH)
+    deleted_batches = repo.delete_incomplete_batches()
+    if deleted_batches:
+        print(
+            "[CLEANUP] Removed incomplete batches before restart: "
+            + ", ".join(deleted_batches)
+        )
     prepare_input_files()
     load_allowed_subs()
     tasks = load_tasks()
