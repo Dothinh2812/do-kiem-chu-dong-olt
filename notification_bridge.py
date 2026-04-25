@@ -1,6 +1,5 @@
 import asyncio
 import os
-from datetime import datetime
 from typing import Dict, List
 
 try:
@@ -12,33 +11,9 @@ except ImportError:
     import notification_service
     from current_off_snapshot import get_snapshot_output_path, load_snapshot_rows_for_batch
 
-RECOVERY_NOTIFICATIONS_ENABLED = False
-
-
 def _emit(log, message: str):
     if log:
         log(message)
-
-
-def _apply_time_filters(alerts: List) -> List:
-    filtered = []
-    for alert in alerts:
-        first_off_time = alert.get("first_off_time") if isinstance(alert, dict) else alert.first_off_time
-        off_duration_minutes = (
-            alert.get("duration_minutes", 0) if isinstance(alert, dict) else alert.off_duration_minutes or 0
-        )
-        if not first_off_time:
-            filtered.append(alert)
-            continue
-        if isinstance(first_off_time, str):
-            first_off_time = datetime.fromisoformat(first_off_time)
-        hour = first_off_time.hour
-        if hour < 6 or hour >= 18:
-            continue
-        if off_duration_minutes >= 720:
-            continue
-        filtered.append(alert)
-    return filtered
 
 
 def load_current_off_snapshot_rows(repo: AlertRepository, batch_id: str) -> List[Dict]:
@@ -50,6 +25,7 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     results = {
         "wide_area": {
             "pending_alerts": 0,
+            "excluded_by_config": 0,
             "marked_sent_alerts": 0,
             "telegram_sent": False,
             "zalo_messages_sent": 0,
@@ -80,7 +56,27 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     wide_area_alerts = repo.list_unsent_wide_area_alerts(batch_id)
     results["wide_area"]["pending_alerts"] = len(wide_area_alerts)
     _emit(log, f"[NOTIFY] Batch {batch_id}: wide-area pending={len(wide_area_alerts)}")
-    if wide_area_alerts:
+    excluded_wide_area_alerts = [
+        alert for alert in wide_area_alerts if notification_service.is_wide_area_alert_excluded(alert, config)
+    ]
+    eligible_wide_area_alerts = [
+        alert for alert in wide_area_alerts if not notification_service.is_wide_area_alert_excluded(alert, config)
+    ]
+    results["wide_area"]["excluded_by_config"] = len(excluded_wide_area_alerts)
+    if excluded_wide_area_alerts:
+        excluded_ports = ", ".join(
+            f"{notification_service.get_olt_display_name(alert.olt_name)}:{alert.port}"
+            for alert in excluded_wide_area_alerts
+        )
+        _emit(
+            log,
+            f"[NOTIFY] Batch {batch_id}: wide-area excluded_by_config={len(excluded_wide_area_alerts)} ports={excluded_ports}",
+        )
+
+    wide_area_policy = notification_service.get_alert_policy_status("wide_area", config)
+    if eligible_wide_area_alerts and not wide_area_policy["allowed"]:
+        _emit(log, f"[NOTIFY] Batch {batch_id}: {wide_area_policy['message']}")
+    if eligible_wide_area_alerts and wide_area_policy["allowed"]:
         telegram_sent = False
         zalo_sent = False
         zalo_sent_count = 0
@@ -88,7 +84,7 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
         no_thread_count = 0
         if config.get("enable_telegram", True):
             message = notification_service.format_wide_area_outage_message(
-                [alert.__dict__ | {"olt_port_key": alert.olt_port_key} for alert in wide_area_alerts]
+                [alert.__dict__ | {"olt_port_key": alert.olt_port_key} for alert in eligible_wide_area_alerts]
             )
             telegram_sent = await notification_service.send_telegram_message(message)
             notification_service.append_notification_delivery_log(
@@ -99,12 +95,12 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
                     "target_id": config.get("telegram_chat_id", ""),
                     "status": "SUCCESS" if telegram_sent else "FAILED",
                     "message_full": message,
-                    "alert_ids": [alert.id for alert in wide_area_alerts if alert.id],
-                    "alert_count": len(wide_area_alerts),
+                    "alert_ids": [alert.id for alert in eligible_wide_area_alerts if alert.id],
+                    "alert_count": len(eligible_wide_area_alerts),
                 }
             )
         if config.get("enable_zalo", True):
-            for alert in wide_area_alerts:
+            for alert in eligible_wide_area_alerts:
                 thread_id = notification_service.get_zalo_thread_by_doi_vt(alert.doi_vt)
                 message = notification_service.format_wide_area_outage_for_zalo(
                     alert.__dict__ | {"olt_port_key": alert.olt_port_key}
@@ -164,8 +160,8 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             }
         )
         if telegram_sent or zalo_sent or (not config.get("enable_telegram", True) and not config.get("enable_zalo", True)):
-            repo.mark_wide_area_alerts_sent(alert.id for alert in wide_area_alerts)
-            results["wide_area"]["marked_sent_alerts"] = len(wide_area_alerts)
+            repo.mark_wide_area_alerts_sent(alert.id for alert in eligible_wide_area_alerts if alert.id)
+            results["wide_area"]["marked_sent_alerts"] += len(eligible_wide_area_alerts)
         _emit(
             log,
             "[NOTIFY] Batch "
@@ -173,9 +169,13 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             f"telegram_sent={telegram_sent} "
             f"zalo_sent={zalo_sent_count} failed={zalo_failed_count} no_thread={no_thread_count}",
         )
+    if excluded_wide_area_alerts:
+        repo.mark_wide_area_alerts_sent(alert.id for alert in excluded_wide_area_alerts if alert.id)
+        results["wide_area"]["marked_sent_alerts"] += len(excluded_wide_area_alerts)
 
     raw_outage_alerts = load_current_off_snapshot_rows(repo, batch_id)
-    outage_alerts = _apply_time_filters(raw_outage_alerts)
+    outage_policy = notification_service.get_alert_policy_status("outage", config)
+    outage_alerts = raw_outage_alerts if outage_policy["allowed"] else []
     results["outage"]["raw_pending_alerts"] = len(raw_outage_alerts)
     results["outage"]["filtered_pending_alerts"] = len(outage_alerts)
     results["outage"]["filtered_out_alerts"] = len(raw_outage_alerts) - len(outage_alerts)
@@ -185,6 +185,8 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
         f"{batch_id}: individual outage pending_raw={len(raw_outage_alerts)} "
         f"pending_after_filters={len(outage_alerts)} filtered_out={len(raw_outage_alerts) - len(outage_alerts)}",
     )
+    if raw_outage_alerts and not outage_policy["allowed"]:
+        _emit(log, f"[NOTIFY] Batch {batch_id}: {outage_policy['message']}")
     if outage_alerts:
         telegram_ok = True
         zalo_results = {"sent": 0}
@@ -238,8 +240,9 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     recovery_alerts = repo.list_unsent_recovery_alerts(batch_id)
     results["recovery"]["pending_alerts"] = len(recovery_alerts)
     _emit(log, f"[NOTIFY] Batch {batch_id}: recovery pending={len(recovery_alerts)}")
-    if recovery_alerts and not RECOVERY_NOTIFICATIONS_ENABLED:
-        _emit(log, f"[NOTIFY] Batch {batch_id}: recovery notifications paused")
+    recovery_policy = notification_service.get_alert_policy_status("recovery", config)
+    if recovery_alerts and not recovery_policy["allowed"]:
+        _emit(log, f"[NOTIFY] Batch {batch_id}: {recovery_policy['message']}")
         return results
     if recovery_alerts:
         telegram_ok = True

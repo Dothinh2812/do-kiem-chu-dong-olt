@@ -145,6 +145,84 @@ def test_get_zalo_thread_by_doi_vt_supports_short_aliases():
     assert notification_service.get_zalo_thread_by_doi_vt("Phúc Thọ") == "3142012656522650111"
 
 
+def test_get_alert_policy_status_returns_disabled_when_type_is_turned_off():
+    policy = notification_service.get_alert_policy_status(
+        "outage",
+        {
+            "enable_individual_alert_notifications": False,
+            "individual_alert_time_window": "06:00-18:00",
+        },
+        now=datetime(2026, 4, 25, 10, 0, 0),
+    )
+
+    assert policy["allowed"] is False
+    assert policy["reason"] == "disabled"
+
+
+def test_get_alert_policy_status_respects_time_window():
+    policy = notification_service.get_alert_policy_status(
+        "wide_area",
+        {
+            "enable_wide_area_alert_notifications": True,
+            "wide_area_alert_time_window": "06:00-18:00",
+        },
+        now=datetime(2026, 4, 25, 22, 0, 0),
+    )
+
+    assert policy["allowed"] is False
+    assert policy["reason"] == "outside_time_window"
+
+
+def test_get_alert_policy_status_allows_overnight_window():
+    policy = notification_service.get_alert_policy_status(
+        "wide_area",
+        {
+            "enable_wide_area_alert_notifications": True,
+            "wide_area_alert_time_window": "22:00-06:00",
+        },
+        now=datetime(2026, 4, 25, 23, 30, 0),
+    )
+
+    assert policy["allowed"] is True
+    assert policy["reason"] == "allowed"
+
+
+def test_parse_wide_area_excluded_ports_supports_semicolon_list():
+    excluded_ports = notification_service.parse_wide_area_excluded_ports(
+        "OLT: STY.G22, Port: 0-1-13; OLT: STY.G23, Port: 0-1-14"
+    )
+
+    assert ("STY.G22", "0-1-13") in excluded_ports
+    assert ("STY.G23", "0-1-14") in excluded_ports
+
+
+def test_is_wide_area_alert_excluded_matches_short_olt_name_from_mapping(tmp_path, monkeypatch):
+    mapping_file = tmp_path / "olt_mapping.xlsx"
+
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["OLT", "TEN_DSLAM"])
+    sheet.append(["HNI.STY.G22.OLT", "STY.G22"])
+    workbook.save(mapping_file)
+
+    monkeypatch.setattr(notification_service, "OLT_MAPPING_FILE", str(mapping_file))
+    monkeypatch.setattr(notification_service, "_OLT_DISPLAY_NAME_CACHE", None)
+
+    excluded = notification_service.is_wide_area_alert_excluded(
+        {
+            "olt_name": "HNI.STY.G22.OLT",
+            "port": "0-1-13",
+        },
+        {
+            "wide_area_alert_excluded_ports": "OLT: STY.G22, Port: 0-1-13",
+        },
+    )
+
+    assert excluded is True
+
+
 def test_append_notification_delivery_log_writes_jsonl_with_preview(tmp_path):
     log_file = tmp_path / "log_message" / "notification_delivery.jsonl"
 
@@ -296,18 +374,22 @@ def test_format_consolidated_outage_for_doi_includes_duration_minutes():
                 "ten_tb": "Ten TB",
                 "dienthoai_lh": "0912345678",
                 "diachi_lapdat": "123 Duong Rat Dai, Phuong Trung Tam, Thi Xa Son Tay",
-                "port_id": "1/1/1:1",
+                "port_id": "HNI.STY.STY.OLT.AL.2.1_1-1-1:1",
                 "ten_nvkt_db": "VNPT - Nguyen Van A",
                 "off_duration_minutes": 15,
+                "first_off_time": "2026-04-25T10:30:00",
             }
         ],
         "Sơn Tây",
     )
 
-    assert "Kéo dài: 15 phút" in message
+    assert "Kéo dài: 0,2 giờ" in message
     assert "[TB001] Ten TB - 0912345678" in message
     assert "👷 Nguyen Van A (1 TB)" in message
-    assert "Địa chỉ: 123 Duong Rat Dai, Phuong Trung Tam, Thi" in message
+    assert "OFF: 25/04/2026 10:30" in message
+    assert "Đ/c: 123 Duong Rat Dai, Phuong Trung Tam, Thi" in message
+    assert "Port: STY.G51_1/1" in message
+    assert "Đội: Sơn Tây" not in message
 
 
 def test_format_consolidated_outage_for_doi_groups_alerts_by_nvkt():
@@ -368,8 +450,54 @@ def test_format_current_off_snapshot_for_doi_uses_precomputed_duration():
     )
 
     assert "🚨 CẢNH BÁO THUÊ BAO OFF" in message
-    assert "Kéo dài: 35 phút" in message
-    assert "[TB001] Ten TB - 0912345678" in message
+    assert "Kéo dài: 0,5 giờ" in message
+    assert "1. [TB001] Ten TB - 0912345678" in message
+    assert "OFF: 24/04/2026 08:10" in message
+    assert "Đ/c: 123 Duong Rat Dai, Phuong Trung Tam, Thi" in message
+    assert "Port: STY.G51_1/1" in message
+    assert "Đội: Tổ Kỹ thuật Địa bàn Sơn Tây" not in message
+    assert "--------" in message
+
+
+def test_format_current_off_snapshot_for_doi_sorts_newest_first_and_numbers_sequentially():
+    message = notification_service.format_current_off_snapshot_for_doi(
+        [
+            {
+                "ma_tb": "TB001",
+                "ten_tb": "Ten TB 1",
+                "dienthoai_lh": "0912345678",
+                "diachi_ld": "Dia chi 1",
+                "port_id": "HNI.STY.STY.OLT.AL.2.1_1-1-1:1",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "first_off_time": "2026-04-24T08:10:00",
+                "duration_minutes": 35,
+            },
+            {
+                "ma_tb": "TB002",
+                "ten_tb": "Ten TB 2",
+                "dienthoai_lh": "0987654321",
+                "diachi_ld": "Dia chi 2",
+                "port_id": "HNI.STY.STY.OLT.AL.2.1_1-1-1:2",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "first_off_time": "2026-04-24T08:25:00",
+                "duration_minutes": 20,
+            },
+            {
+                "ma_tb": "TB003",
+                "ten_tb": "Ten TB 3",
+                "dienthoai_lh": "0900000000",
+                "diachi_ld": "Dia chi 3",
+                "port_id": "HNI.STY.STY.OLT.AL.2.1_1-1-1:3",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "duration_minutes": 10,
+            },
+        ],
+        "Tổ Kỹ thuật Địa bàn Sơn Tây",
+    )
+
+    assert message.index("1. [TB002] Ten TB 2 - 0987654321") < message.index("2. [TB001] Ten TB 1 - 0912345678")
+    assert message.index("2. [TB001] Ten TB 1 - 0912345678") < message.index("3. [TB003] Ten TB 3 - 0900000000")
+    assert message.count("--------") == 3
 
 
 def test_format_current_off_snapshot_by_nvkt_uses_first_off_time_string():

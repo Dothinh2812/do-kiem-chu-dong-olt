@@ -1,12 +1,15 @@
 import csv
 import json
+import math
 import os
+import re
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from typing import Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
 from openpyxl import load_workbook
 
 try:
@@ -23,18 +26,59 @@ DEFAULT_OPENZCA_PROFILE = os.environ.get("OPENZCA_PROFILE", "zalo2")
 NOTIFICATION_DELIVERY_LOG_FILE = os.path.join("log_message", "notification_delivery.jsonl")
 _OLT_DISPLAY_NAME_CACHE = None
 
-DEFAULT_CONFIG = {
-    "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-    "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
-    "enable_telegram": True,
-    "enable_zalo": True,
+load_dotenv()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_str(name: str, default: str = "") -> str:
+    return str(os.environ.get(name, default) or "").strip()
+
+
+def _build_default_config() -> Dict:
+    return {
+        "telegram_bot_token": _env_str("TELEGRAM_BOT_TOKEN", ""),
+        "telegram_chat_id": _env_str("TELEGRAM_CHAT_ID", ""),
+        "enable_telegram": _env_bool("ENABLE_TELEGRAM", True),
+        "enable_zalo": _env_bool("ENABLE_ZALO", True),
+        "enable_individual_alert_notifications": _env_bool("ENABLE_INDIVIDUAL_ALERT_NOTIFICATIONS", True),
+        "enable_wide_area_alert_notifications": _env_bool("ENABLE_WIDE_AREA_ALERT_NOTIFICATIONS", True),
+        "enable_recovery_alert_notifications": _env_bool("ENABLE_RECOVERY_ALERT_NOTIFICATIONS", False),
+        "individual_alert_time_window": _env_str("INDIVIDUAL_ALERT_TIME_WINDOW", ""),
+        "wide_area_alert_time_window": _env_str("WIDE_AREA_ALERT_TIME_WINDOW", ""),
+        "recovery_alert_time_window": _env_str("RECOVERY_ALERT_TIME_WINDOW", ""),
+        "wide_area_alert_excluded_ports": _env_str("WIDE_AREA_ALERT_EXCLUDED_PORTS", ""),
+    }
+
+
+_ALERT_POLICY_CONFIG = {
+    "outage": {
+        "enabled_key": "enable_individual_alert_notifications",
+        "window_key": "individual_alert_time_window",
+        "label": "individual outage",
+    },
+    "wide_area": {
+        "enabled_key": "enable_wide_area_alert_notifications",
+        "window_key": "wide_area_alert_time_window",
+        "label": "wide-area",
+    },
+    "recovery": {
+        "enabled_key": "enable_recovery_alert_notifications",
+        "window_key": "recovery_alert_time_window",
+        "label": "recovery",
+    },
 }
 
 DOI_VT_TO_THREAD = CANONICAL_DOI_VT_TO_THREAD
 
 
 def load_config() -> Dict:
-    config = DEFAULT_CONFIG.copy()
+    config = _build_default_config()
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
@@ -42,6 +86,105 @@ def load_config() -> Dict:
         except Exception as exc:
             print(f"⚠️ Could not load {CONFIG_FILE}: {exc}")
     return config
+
+
+def _parse_hhmm(value: str) -> dt_time:
+    hour_str, minute_str = value.split(":", 1)
+    hour = int(hour_str)
+    minute = int(minute_str)
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError("hour or minute out of range")
+    return dt_time(hour=hour, minute=minute)
+
+
+def _is_within_time_window(window: str, now: Optional[datetime] = None) -> bool:
+    normalized_window = str(window or "").strip()
+    if not normalized_window:
+        return True
+
+    try:
+        start_raw, end_raw = [part.strip() for part in normalized_window.split("-", 1)]
+        start_time = _parse_hhmm(start_raw)
+        end_time = _parse_hhmm(end_raw)
+    except ValueError:
+        print(f"⚠️ Invalid notification time window '{normalized_window}', allowing send.")
+        return True
+
+    current_time = (now or datetime.now()).time().replace(second=0, microsecond=0)
+    if start_time <= end_time:
+        return start_time <= current_time <= end_time
+    return current_time >= start_time or current_time <= end_time
+
+
+def get_alert_policy_status(alert_type: str, config: Optional[Dict] = None, now: Optional[datetime] = None) -> Dict[str, str]:
+    policy = _ALERT_POLICY_CONFIG[alert_type]
+    active_config = config or load_config()
+
+    if not active_config.get(policy["enabled_key"], True):
+        return {
+            "allowed": False,
+            "reason": "disabled",
+            "message": f"{policy['label']} notifications disabled by config",
+        }
+
+    window = str(active_config.get(policy["window_key"], "") or "").strip()
+    if not _is_within_time_window(window, now=now):
+        return {
+            "allowed": False,
+            "reason": "outside_time_window",
+            "message": f"{policy['label']} notifications outside allowed window {window}",
+        }
+
+    return {
+        "allowed": True,
+        "reason": "allowed",
+        "message": f"{policy['label']} notifications allowed",
+    }
+
+
+def _normalize_excluded_port_value(value: str) -> str:
+    return str(value or "").strip().upper()
+
+
+def parse_wide_area_excluded_ports(raw_value: str) -> set[tuple[str, str]]:
+    normalized_raw_value = str(raw_value or "").strip()
+    if not normalized_raw_value:
+        return set()
+
+    entries = re.split(r"(?:\r?\n){2,}|;", normalized_raw_value)
+    excluded_ports = set()
+
+    for entry in entries:
+        compact_entry = " ".join(str(entry or "").split())
+        if not compact_entry:
+            continue
+
+        olt_match = re.search(r"OLT\s*:\s*([^\n,;]+?)(?=\s+PORT\s*:|$|,)", compact_entry, flags=re.IGNORECASE)
+        port_match = re.search(r"PORT\s*:\s*([^\n,;]+)", compact_entry, flags=re.IGNORECASE)
+        if not olt_match or not port_match:
+            continue
+
+        olt_name = _normalize_excluded_port_value(olt_match.group(1))
+        port_name = _normalize_excluded_port_value(port_match.group(1))
+        if olt_name and port_name:
+            excluded_ports.add((olt_name, port_name))
+
+    return excluded_ports
+
+
+def is_wide_area_alert_excluded(alert, config: Optional[Dict] = None) -> bool:
+    active_config = config or load_config()
+    excluded_ports = parse_wide_area_excluded_ports(active_config.get("wide_area_alert_excluded_ports", ""))
+    if not excluded_ports:
+        return False
+
+    normalized_olt_names = {
+        _normalize_excluded_port_value(_value(alert, "olt_name", "")),
+        _normalize_excluded_port_value(get_olt_display_name(_value(alert, "olt_name", ""))),
+    }
+    normalized_port = _normalize_excluded_port_value(_value(alert, "port", ""))
+
+    return any((olt_name, normalized_port) in excluded_ports for olt_name in normalized_olt_names if olt_name)
 
 
 def get_zalo_thread_by_doi_vt(doi_vt: str) -> Optional[str]:
@@ -162,12 +305,51 @@ def _format_outage_duration(obj) -> str:
     return f"{duration_minutes} phút"
 
 
+def _format_outage_duration_hours(obj) -> str:
+    duration_minutes = _resolve_outage_duration_minutes(obj)
+    if duration_minutes is None:
+        return "-"
+    duration_hours = math.floor((duration_minutes / 60) * 10) / 10
+    return f"{duration_hours:.1f}".replace(".", ",") + " giờ"
+
+
 def _truncate_address(value: str, limit: int = 40) -> str:
     return (value or "").strip()[:limit] or "-"
 
 
 def _resolve_address(obj) -> str:
     return _truncate_address(_value(obj, "diachi_lapdat", "") or _value(obj, "diachi_ld", "") or "")
+
+
+def _format_off_time(obj) -> str:
+    first_off_time = _coerce_datetime(_value(obj, "first_off_time"))
+    if first_off_time:
+        return first_off_time.strftime("%d/%m/%Y %H:%M")
+    raw_value = str(_value(obj, "first_off_time") or "").strip()
+    return raw_value or "-"
+
+
+def _format_doi_port_display_name(port_id: str) -> str:
+    display_name = get_port_display_name(port_id)
+    olt_name, separator, remainder = display_name.partition("_")
+    if not separator:
+        return display_name
+
+    port_segments = remainder.split(":", 1)[0].split("-")
+    if len(port_segments) >= 3:
+        return f"{olt_name}_{port_segments[1]}/{port_segments[2]}"
+    return display_name
+
+
+def _sort_alerts_newest_first(alerts: List) -> List:
+    def sort_key(alert):
+        first_off_time = _coerce_datetime(_value(alert, "first_off_time"))
+        duration_minutes = _resolve_outage_duration_minutes(alert)
+        if first_off_time:
+            return (0, -first_off_time.timestamp(), duration_minutes or 0, str(_value(alert, "ma_tb", "") or ""))
+        return (1, duration_minutes or 0, 0, str(_value(alert, "ma_tb", "") or ""))
+
+    return sorted(alerts, key=sort_key)
 
 
 def append_notification_delivery_log(entry: Dict, log_file: str = NOTIFICATION_DELIVERY_LOG_FILE) -> None:
@@ -366,7 +548,6 @@ def format_consolidated_outage_for_doi(alerts: List, doi_vt: str) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines = [
         f"🚨 CẢNH BÁO THUÊ BAO OFF - {now}",
-        f"Đội: {doi_vt}",
         "",
     ]
     groups = defaultdict(list)
@@ -374,18 +555,22 @@ def format_consolidated_outage_for_doi(alerts: List, doi_vt: str) -> str:
         nvkt = _short_nvkt(_value(alert, "ten_nvkt_db", "") or "")
         groups[nvkt or "Chưa gán NVKT"].append(alert)
 
+    alert_index = 1
     for nvkt, items in groups.items():
         lines.append(f"👷 {nvkt} ({len(items)} TB)")
-        for idx, alert in enumerate(items, 1):
+        for alert in _sort_alerts_newest_first(items):
             ma_tb = _value(alert, "ma_tb", "") or ""
             ten_tb = _value(alert, "ten_tb", "") or ""
             sdt = _value(alert, "dienthoai_lh", "") or "-"
             dia_chi = _resolve_address(alert)
             port_id = _value(alert, "port_id", "") or ""
-            lines.append(f"{idx}. [{ma_tb}] {ten_tb} - {sdt}")
-            lines.append(f"   Địa chỉ: {dia_chi}")
-            lines.append(f"   Port: {get_port_display_name(port_id)}")
-            lines.append(f"   Kéo dài: {_format_outage_duration(alert)}")
+            lines.append(f"{alert_index}. [{ma_tb}] {ten_tb} - {sdt}")
+            lines.append(f"   OFF: {_format_off_time(alert)}")
+            lines.append(f"   Đ/c: {dia_chi}")
+            lines.append(f"   Port: {_format_doi_port_display_name(port_id)}")
+            lines.append(f"   Kéo dài: {_format_outage_duration_hours(alert)}")
+            lines.append("--------")
+            alert_index += 1
         lines.append("")
     return "\n".join(lines)
 
