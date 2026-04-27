@@ -15,6 +15,7 @@ all_ports_ready*.json
 storage_state.json
 
 log_message/
+logs/
 *.log
 runtime/
 

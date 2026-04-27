@@ -20,7 +20,11 @@ try:
         WideAreaAlert,
     )
     from .notification_bridge import dispatch_batch_notifications
-    from .pattern_exclusion import get_pattern_exclusion_list, update_exclusion_table
+    from .subscriber_off_scoring import (
+        LIKELY_SELF_POWER_OFF,
+        score_pattern_suppression_for_current_offs,
+        update_exclusion_table_from_results,
+    )
     from .current_off_snapshot import (
         build_current_off_snapshot,
         build_snapshot_payload,
@@ -43,7 +47,11 @@ except ImportError:
         WideAreaAlert,
     )
     from notification_bridge import dispatch_batch_notifications
-    from pattern_exclusion import get_pattern_exclusion_list, update_exclusion_table
+    from subscriber_off_scoring import (
+        LIKELY_SELF_POWER_OFF,
+        score_pattern_suppression_for_current_offs,
+        update_exclusion_table_from_results,
+    )
     from current_off_snapshot import (
         build_current_off_snapshot,
         build_snapshot_payload,
@@ -63,6 +71,8 @@ def _emit(log, message: str):
 
 def normalize_status(raw_status) -> str:
     status = str(raw_status or "").upper()
+    if status == "PORT_DOWN":
+        return "PORT_DOWN"
     if "OFF" in status:
         return "OFF"
     if "ON" in status:
@@ -163,10 +173,10 @@ def _transition(snapshot: SubscriberSnapshot, prev: Optional[Dict]):
                 outage,
                 recovery,
             )
-        if snapshot.status == "OFF":
+        if snapshot.status in {"OFF", "PORT_DOWN"}:
             return (
                 _base_state(
-                    snapshot, STABLE_OFF, "OFF", 0, 1, None, snapshot.measured_at, None, None
+                    snapshot, STABLE_OFF, snapshot.status, 0, 1, None, snapshot.measured_at, None, None
                 ),
                 outage,
                 recovery,
@@ -241,7 +251,7 @@ def _transition(snapshot: SubscriberSnapshot, prev: Optional[Dict]):
             recovery,
         )
 
-    if snapshot.status == "OFF":
+    if snapshot.status in {"OFF", "PORT_DOWN"}:
         off_count += 1
         on_count = 0
         if current_state == STABLE_ON:
@@ -285,7 +295,7 @@ def _transition(snapshot: SubscriberSnapshot, prev: Optional[Dict]):
             _base_state(
                 snapshot,
                 next_state,
-                "OFF",
+                snapshot.status,
                 on_count,
                 off_count,
                 first_on_time,
@@ -318,9 +328,11 @@ def _detect_wide_area(
     snapshot_offs: Iterable[SubscriberSnapshot],
     batch_id: str,
     threshold: int,
+    state_rows: Optional[Dict[str, Dict]] = None,
     blocked_ma_tbs: Optional[Iterable[str]] = None,
 ) -> List[WideAreaAlert]:
     grouped = defaultdict(list)
+    state_rows = state_rows or {}
     blocked = {ma_tb for ma_tb in (blocked_ma_tbs or []) if ma_tb}
     for snapshot in snapshot_offs:
         if snapshot.ma_tb and snapshot.ma_tb not in blocked:
@@ -328,31 +340,71 @@ def _detect_wide_area(
 
     alerts = []
     for parent_port_key, snapshots in grouped.items():
-        if len(snapshots) <= threshold:
+        has_port_down = any(snapshot.status == "PORT_DOWN" for snapshot in snapshots)
+        if not has_port_down and len(snapshots) <= threshold:
             continue
+        if has_port_down:
+            first = snapshots[0]
+            port = parent_port_key.split("_", 1)[1] if "_" in parent_port_key else parent_port_key
+            alerts.append(
+                WideAreaAlert(
+                    batch_id=batch_id,
+                    parent_port_key=parent_port_key,
+                    olt_name=first.olt_name,
+                    port=port,
+                    subscriber_count=len(snapshots),
+                    incident_type="port_down",
+                    subscriber_keys=[snapshot.subscriber_key for snapshot in snapshots],
+                    subscriber_list=[
+                        {
+                            "ma_tb": snapshot.ma_tb,
+                            "ten_tb": snapshot.ten_tb,
+                            "ten_nvkt_db": snapshot.ten_nvkt_db,
+                            "onu_last_off": snapshot.onu_last_off,
+                        }
+                        for snapshot in snapshots
+                    ],
+                    doi_vt=first.doi_vt,
+                    alert_time=first.measured_at,
+                    first_off_time=first.measured_at,
+                    off_duration_minutes=0,
+                )
+            )
+            continue
+        blank_last_off_snapshots: List[SubscriberSnapshot] = []
         candidates = []
         for snapshot in snapshots:
             onu_last_off = _parse_device_event_time(snapshot.onu_last_off)
             if onu_last_off is None:
+                blank_last_off_snapshots.append(snapshot)
                 continue
             candidates.append((snapshot, onu_last_off))
-        if len(candidates) <= threshold:
-            continue
 
-        candidates.sort(key=lambda item: item[1])
         best_cluster: List[SubscriberSnapshot] = []
-        left = 0
-        for right, (_snapshot, right_dt) in enumerate(candidates):
-            while left <= right and (right_dt - candidates[left][1]).total_seconds() >= 300:
-                left += 1
-            cluster = [item[0] for item in candidates[left : right + 1]]
-            if len(cluster) > len(best_cluster):
-                best_cluster = cluster
+        if candidates:
+            candidates.sort(key=lambda item: item[1])
+            left = 0
+            for right, (_snapshot, right_dt) in enumerate(candidates):
+                while left <= right and (right_dt - candidates[left][1]).total_seconds() >= 300:
+                    left += 1
+                cluster = [item[0] for item in candidates[left : right + 1]]
+                if len(cluster) > len(best_cluster):
+                    best_cluster = cluster
 
-        if len(best_cluster) <= threshold:
+        qualified_snapshots = best_cluster + blank_last_off_snapshots
+        if len(qualified_snapshots) <= threshold:
             continue
 
-        first = best_cluster[0]
+        first = qualified_snapshots[0]
+        first_off_candidates = [
+            _parse_optional_dt((state_rows.get(snapshot.subscriber_key) or {}).get("first_off_time"))
+            for snapshot in qualified_snapshots
+        ]
+        first_off_candidates = [dt for dt in first_off_candidates if dt is not None]
+        first_off_time = min(first_off_candidates) if first_off_candidates else None
+        off_duration_minutes = 0
+        if first_off_time and first.measured_at:
+            off_duration_minutes = max(int((first.measured_at - first_off_time).total_seconds() // 60), 0)
         port = parent_port_key.split("_", 1)[1] if "_" in parent_port_key else parent_port_key
         alerts.append(
             WideAreaAlert(
@@ -360,8 +412,9 @@ def _detect_wide_area(
                 parent_port_key=parent_port_key,
                 olt_name=first.olt_name,
                 port=port,
-                subscriber_count=len(best_cluster),
-                subscriber_keys=[snapshot.subscriber_key for snapshot in best_cluster],
+                subscriber_count=len(qualified_snapshots),
+                incident_type="wide_area",
+                subscriber_keys=[snapshot.subscriber_key for snapshot in qualified_snapshots],
                 subscriber_list=[
                     {
                         "ma_tb": snapshot.ma_tb,
@@ -369,10 +422,12 @@ def _detect_wide_area(
                         "ten_nvkt_db": snapshot.ten_nvkt_db,
                         "onu_last_off": snapshot.onu_last_off,
                     }
-                    for snapshot in best_cluster
+                    for snapshot in qualified_snapshots
                 ],
                 doi_vt=first.doi_vt,
                 alert_time=first.measured_at,
+                first_off_time=first_off_time,
+                off_duration_minutes=off_duration_minutes,
             )
         )
     return alerts
@@ -411,26 +466,38 @@ def process_completed_batch(
     unknown_count = 0
 
     _emit(log, f"[ALERT] Batch {batch_id}: processing state machine...")
+    previous_state_rows = repo.fetch_state_map(snapshot.subscriber_key for snapshot in snapshots)
+    next_state_rows = {}
+    states_to_save = []
+    outage_alerts_to_insert = []
+    recovery_alerts_to_insert = []
     for idx, snapshot in enumerate(snapshots, start=1):
         if snapshot.status == "UNKNOWN":
             unknown_count += 1
             continue
-        prev = repo.get_state_row(snapshot.subscriber_key)
+        prev = previous_state_rows.get(snapshot.subscriber_key)
         next_state, outage, recovery = _transition(snapshot, prev)
-        repo.save_state(next_state)
+        states_to_save.append(next_state)
+        next_state_rows[snapshot.subscriber_key] = next_state
         processed_count += 1
         if outage:
-            repo.insert_outage_alert(outage)
+            outage_alerts_to_insert.append(outage)
             outage_count += 1
         if recovery:
-            repo.insert_recovery_alert(recovery)
+            recovery_alerts_to_insert.append(recovery)
             recovery_count += 1
         if snapshot.status == "ON" and snapshot.ma_tb:
             on_ma_tbs.add(snapshot.ma_tb)
-        if snapshot.status == "OFF":
+        if snapshot.status in {"OFF", "PORT_DOWN"}:
             current_offs.append(snapshot)
         if progress_every and idx % progress_every == 0:
             _emit(log, f"[ALERT] Batch {batch_id}: processing state machine {idx}/{len(snapshots)}")
+
+    repo.persist_state_machine_results(
+        states_to_save,
+        outage_alerts_to_insert,
+        recovery_alerts_to_insert,
+    )
 
     _emit(
         log,
@@ -440,42 +507,73 @@ def process_completed_batch(
         f"outage_created={outage_count} recovery_created={recovery_count}",
     )
 
+    state_rows = {
+        snapshot.subscriber_key: next_state_rows[snapshot.subscriber_key]
+        for snapshot in current_offs
+        if snapshot.subscriber_key in next_state_rows
+    }
+
     _emit(log, f"[ALERT] Batch {batch_id}: detecting wide-area outages...")
-    wide_area_alerts = _detect_wide_area(current_offs, batch_id, wide_area_threshold, blocked_ma_tbs=on_ma_tbs)
+    wide_area_alerts = _detect_wide_area(
+        current_offs,
+        batch_id,
+        wide_area_threshold,
+        state_rows=state_rows,
+        blocked_ma_tbs=on_ma_tbs,
+    )
     for alert in wide_area_alerts:
         repo.insert_wide_area_alert(alert)
         repo.suppress_outage_alerts(batch_id, alert.subscriber_keys, "wide_area")
     _emit(log, f"[ALERT] Batch {batch_id}: wide-area detected: {len(wide_area_alerts)} ports")
 
-    _emit(log, f"[ALERT] Batch {batch_id}: applying pattern exclusion...")
-    pattern_updates = update_exclusion_table(db_path)
-    exclusion_list = get_pattern_exclusion_list(db_path)
-    to_suppress = []
-    if exclusion_list:
-        rows = repo.list_unsent_outage_alerts(batch_id)
-        to_suppress = [row.subscriber_key for row in rows if row.ma_tb in exclusion_list]
-        repo.suppress_outage_alerts(batch_id, to_suppress, "pattern_exclusion")
-    _emit(
-        log,
-        f"[ALERT] Batch {batch_id}: pattern exclusion updated={pattern_updates} suppressed={len(to_suppress)}",
-    )
-
-    state_rows = {
-        snapshot.subscriber_key: repo.get_state_row(snapshot.subscriber_key)
-        for snapshot in current_offs
-    }
     wide_area_subscriber_keys = {
         subscriber_key
         for alert in wide_area_alerts
         for subscriber_key in alert.subscriber_keys
     }
+
+    _emit(log, f"[ALERT] Batch {batch_id}: applying pattern exclusion...")
+    measured_at = max((snapshot.measured_at for snapshot in snapshots), default=None)
+    to_suppress, scoring_results = score_pattern_suppression_for_current_offs(
+        db_path,
+        current_offs,
+        state_rows,
+        batch_id=batch_id,
+        wide_area_subscriber_keys=wide_area_subscriber_keys,
+        reference_time=measured_at,
+    )
+    pattern_updates = update_exclusion_table_from_results(db_path, scoring_results)
+    if to_suppress:
+        repo.suppress_outage_alerts(batch_id, to_suppress, "pattern_exclusion")
+    suppressed_keys = set(to_suppress)
+    customer_poweroff_suppressed_results = [
+        result
+        for result in scoring_results
+        if result.subscriber_key in suppressed_keys
+        and result.classification == LIKELY_SELF_POWER_OFF
+    ]
+    customer_poweroff_suppressed_codes = {
+        result.ma_tb or result.subscriber_key
+        for result in customer_poweroff_suppressed_results
+    }
+    exclusion_list = {
+        result.ma_tb
+        for result in scoring_results
+        if result.subscriber_key in suppressed_keys and result.ma_tb
+    }
+    _emit(
+        log,
+        f"[ALERT] Batch {batch_id}: pattern scoring rows={len(scoring_results)} "
+        f"updated={pattern_updates} suppressed={len(to_suppress)} "
+        f"customer_poweroff_suppressed={len(customer_poweroff_suppressed_codes)} "
+        f"customer_poweroff_subscribers={len(customer_poweroff_suppressed_results)}",
+    )
     current_off_snapshot_rows = build_current_off_snapshot(
         current_offs,
         state_rows,
         exclusion_list=exclusion_list,
         wide_area_subscriber_keys=wide_area_subscriber_keys,
     )
-    measured_at = max((snapshot.measured_at for snapshot in snapshots), default=None)
     current_off_snapshot_file = str(get_snapshot_output_path(os.path.dirname(db_path) or "."))
     current_off_snapshot_payload = build_snapshot_payload(
         batch_id,
@@ -512,6 +610,8 @@ def process_completed_batch(
         "wide_area_alerts_created": len(wide_area_alerts),
         "pattern_updates": pattern_updates,
         "pattern_suppressed_count": len(to_suppress),
+        "customer_poweroff_suppressed_count": len(customer_poweroff_suppressed_codes),
+        "customer_poweroff_suppressed_subscribers": len(customer_poweroff_suppressed_results),
         "current_off_snapshot_total": len(current_off_snapshot_rows),
         "current_off_snapshot_active": sum(
             1

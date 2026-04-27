@@ -187,6 +187,39 @@ def test_get_alert_policy_status_allows_overnight_window():
     assert policy["reason"] == "allowed"
 
 
+def test_filter_current_off_alerts_keeps_only_rows_after_today_cutoff():
+    alerts = [
+        {"ma_tb": "OLD", "first_off_time": "2026-04-26T05:59:00"},
+        {"ma_tb": "KEEP", "first_off_time": "2026-04-26T06:00:00"},
+        {"ma_tb": "KEEP2", "first_off_time": "2026-04-26T06:10:00"},
+        {"ma_tb": "YESTERDAY", "first_off_time": "2026-04-25T23:00:00"},
+        {"ma_tb": "MISSING", "first_off_time": ""},
+    ]
+
+    filtered = notification_service.filter_current_off_alerts_by_cutoff(
+        alerts,
+        {"current_off_alert_start_time": "06:00"},
+        now=datetime(2026, 4, 26, 7, 30, 0),
+    )
+
+    assert [alert["ma_tb"] for alert in filtered] == ["KEEP", "KEEP2"]
+
+
+def test_filter_current_off_alerts_allows_empty_cutoff_to_disable_filter():
+    alerts = [
+        {"ma_tb": "OLD", "first_off_time": "2026-04-25T23:00:00"},
+        {"ma_tb": "MISSING", "first_off_time": ""},
+    ]
+
+    filtered = notification_service.filter_current_off_alerts_by_cutoff(
+        alerts,
+        {"current_off_alert_start_time": ""},
+        now=datetime(2026, 4, 26, 7, 30, 0),
+    )
+
+    assert filtered == alerts
+
+
 def test_parse_wide_area_excluded_ports_supports_semicolon_list():
     excluded_ports = notification_service.parse_wide_area_excluded_ports(
         "OLT: STY.G22, Port: 0-1-13; OLT: STY.G23, Port: 0-1-14"
@@ -312,6 +345,23 @@ def test_format_wide_area_outage_message_includes_duration_minutes():
     assert "Kéo dài: 20 phút" in message
 
 
+def test_format_wide_area_outage_message_uses_port_down_title_for_port_down_incident():
+    message = notification_service.format_wide_area_outage_message(
+        [
+            {
+                "port": "1/1/1",
+                "subscriber_count": 3,
+                "olt_name": "HNI.STY.DGM.OLT.ZT.1.1",
+                "incident_type": "port_down",
+                "subscriber_list": [],
+            }
+        ]
+    )
+
+    assert "CẢNH BÁO PORT OLT DOWN" in message
+    assert "CẢNH BÁO SỰ CỐ DIỆN RỘNG" not in message
+
+
 def test_format_consolidated_outage_by_nvkt_includes_duration_minutes():
     message = notification_service.format_consolidated_outage_by_nvkt(
         [
@@ -363,6 +413,43 @@ def test_format_wide_area_outage_for_zalo_includes_duration_minutes():
         }
     )
 
+    assert "Kéo dài: 20 phút" in message
+
+
+def test_format_wide_area_outage_for_zalo_uses_port_down_title_for_port_down_incident():
+    message = notification_service.format_wide_area_outage_for_zalo(
+        {
+            "olt_name": "HNI.STY.DGM.OLT.ZT.1.1",
+            "port": "1/1/1",
+            "subscriber_count": 3,
+            "incident_type": "port_down",
+            "subscriber_list": [],
+        }
+    )
+
+    assert "CẢNH BÁO PORT OLT DOWN" in message
+    assert "CẢNH BÁO SỰ CỐ DIỆN RỘNG" not in message
+
+
+def test_format_wide_area_outage_for_zalo_includes_start_time_and_fallback_duration(monkeypatch):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 4, 27, 10, 0, 0)
+
+    monkeypatch.setattr(notification_service, "datetime", FrozenDateTime)
+
+    message = notification_service.format_wide_area_outage_for_zalo(
+        {
+            "olt_name": "HNI.STY.DGM.OLT.ZT.1.1",
+            "port": "1-1-8",
+            "subscriber_count": 20,
+            "first_off_time": "2026-04-27T09:40:00",
+            "subscriber_list": [],
+        }
+    )
+
+    assert "Bắt đầu: 27/04/2026 09:40" in message
     assert "Kéo dài: 20 phút" in message
 
 

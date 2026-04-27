@@ -76,6 +76,49 @@ def repo_paths(tmp_path):
     return repo, measurement_db
 
 
+def test_alert_repository_ensure_schema_adds_wide_area_timing_columns(tmp_path):
+    measurement_db = tmp_path / "onu_measurements.db"
+    source_db = tmp_path / "database.db"
+
+    with sqlite3.connect(measurement_db) as conn:
+        conn.execute(RAW_SCHEMA)
+        conn.execute(
+            """
+            CREATE TABLE wide_area_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                parent_port_key TEXT NOT NULL,
+                olt_name TEXT NOT NULL,
+                port TEXT NOT NULL,
+                subscriber_count INTEGER NOT NULL,
+                subscriber_keys_json TEXT NOT NULL,
+                subscriber_summary_json TEXT NOT NULL,
+                doi_vt TEXT,
+                alert_time DATETIME NOT NULL,
+                notification_sent BOOLEAN DEFAULT FALSE,
+                notification_time DATETIME
+            )
+            """
+        )
+        conn.commit()
+
+    with sqlite3.connect(source_db) as conn:
+        conn.execute("CREATE TABLE danhba (sub TEXT)")
+        conn.commit()
+
+    repo = AlertRepository(str(measurement_db), str(source_db))
+    repo.ensure_schema()
+
+    with sqlite3.connect(measurement_db) as conn:
+        columns = {
+            row[1]: row[2]
+            for row in conn.execute("PRAGMA table_info(wide_area_alerts)").fetchall()
+        }
+
+    assert "first_off_time" in columns
+    assert "off_duration_minutes" in columns
+
+
 def test_dispatch_batch_notifications_returns_detailed_breakdown_and_logs(repo_paths, monkeypatch):
     repo, measurement_db = repo_paths
 
@@ -280,6 +323,67 @@ def test_dispatch_batch_notifications_logs_zalo_error_details_for_wide_area(repo
     assert payload["command"] == ["/node", "/openzca", "--profile", "zalo2", "msg", "send", "7968537750365285360"]
 
 
+def test_dispatch_batch_notifications_wide_area_message_includes_start_time_and_duration(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    repo.insert_wide_area_alert(
+        WideAreaAlert(
+            batch_id="b1",
+            parent_port_key="HNI.BVI.BVI.OLT.AL.2.1_1-1-2",
+            olt_name="HNI.BVI.BVI.OLT.AL.2.1",
+            port="1-1-2",
+            subscriber_count=8,
+            subscriber_keys=["HNI.BVI.BVI.OLT.AL.2.1_1-1-2:1"],
+            subscriber_list=[{"ma_tb": "TB001", "ten_tb": "Ten TB", "ten_nvkt_db": "VNPT - Nguyen Van A"}],
+            doi_vt="Tổ Kỹ thuật Địa bàn Quảng Oai",
+            alert_time=datetime(2026, 4, 24, 12, 30, 0),
+            first_off_time=datetime(2026, 4, 24, 12, 10, 0),
+            off_duration_minutes=20,
+        )
+    )
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {"enable_telegram": False, "enable_zalo": True},
+    )
+
+    sent_messages = []
+
+    async def fake_send_zalo_message_to_thread_detailed(message, thread_id, client=None):
+        sent_messages.append((thread_id, message))
+        return {
+            "success": True,
+            "thread_id": thread_id,
+            "message": message,
+            "response": "ok",
+            "error": "",
+            "stdout": "ok",
+            "stderr": "",
+            "returncode": 0,
+            "command": [],
+        }
+
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "send_zalo_message_to_thread_detailed",
+        fake_send_zalo_message_to_thread_detailed,
+    )
+
+    result = dispatch_batch_notifications(repo, "b1", log=lambda _msg: None)
+
+    assert result["wide_area"]["zalo_messages_sent"] == 1
+    assert result["wide_area"]["marked_sent_alerts"] == 1
+    assert len(sent_messages) == 1
+    assert "Bắt đầu: 24/04/2026 12:10" in sent_messages[0][1]
+    assert "Kéo dài: 20 phút" in sent_messages[0][1]
+
+
 def test_dispatch_batch_notifications_temporarily_skips_recovery_notifications(repo_paths, monkeypatch):
     repo, measurement_db = repo_paths
 
@@ -385,6 +489,118 @@ def test_dispatch_batch_notifications_sends_current_off_snapshot_every_batch(rep
     assert result["outage"]["marked_sent_alerts"] == 1
 
 
+def test_dispatch_batch_notifications_sends_individual_alerts_only_on_configured_cycle(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_rows = [
+        {
+            "batch_id": "b2",
+            "ma_tb": "TB001",
+            "ten_tb": "Ten TB",
+            "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+            "ten_nvkt_db": "VNPT - Nguyen Van A",
+            "dienthoai_lh": "0912345678",
+            "diachi_ld": "Dia chi",
+            "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+            "first_off_time": "2026-04-24T12:05:00",
+            "duration_minutes": 25,
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+        }
+    ]
+
+    monkeypatch.setattr(notification_bridge, "load_current_off_snapshot_rows", lambda repo, batch_id: snapshot_rows)
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+            "individual_alert_send_every_batches": 3,
+        },
+    )
+
+    first_result = dispatch_batch_notifications(repo, "b2", log=lambda _message: None)
+    second_result = dispatch_batch_notifications(repo, "b3", log=lambda _message: None)
+    third_result = dispatch_batch_notifications(repo, "b4", log=lambda _message: None)
+
+    assert first_result["outage"]["raw_pending_alerts"] == 1
+    assert first_result["outage"]["filtered_pending_alerts"] == 0
+    assert first_result["outage"]["filtered_out_alerts"] == 1
+    assert first_result["outage"]["marked_sent_alerts"] == 0
+
+    assert second_result["outage"]["raw_pending_alerts"] == 1
+    assert second_result["outage"]["filtered_pending_alerts"] == 0
+    assert second_result["outage"]["filtered_out_alerts"] == 1
+    assert second_result["outage"]["marked_sent_alerts"] == 0
+
+    assert third_result["outage"]["raw_pending_alerts"] == 1
+    assert third_result["outage"]["filtered_pending_alerts"] == 1
+    assert third_result["outage"]["filtered_out_alerts"] == 0
+    assert third_result["outage"]["marked_sent_alerts"] == 1
+
+
+def test_dispatch_batch_notifications_counts_individual_cycle_globally_across_empty_batches(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_rows_by_batch = {
+        "b2": [],
+        "b3": [
+            {
+                "batch_id": "b3",
+                "ma_tb": "TB001",
+                "ten_tb": "Ten TB",
+                "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "dienthoai_lh": "0912345678",
+                "diachi_ld": "Dia chi",
+                "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+                "first_off_time": "2026-04-24T12:05:00",
+                "duration_minutes": 25,
+                "suppressed_by_pattern": False,
+                "suppressed_by_wide_area": False,
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        notification_bridge,
+        "load_current_off_snapshot_rows",
+        lambda repo, batch_id: snapshot_rows_by_batch.get(batch_id, []),
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+            "individual_alert_send_every_batches": 2,
+        },
+    )
+
+    empty_batch_result = dispatch_batch_notifications(repo, "b2", log=lambda _message: None)
+    next_batch_result = dispatch_batch_notifications(repo, "b3", log=lambda _message: None)
+
+    assert empty_batch_result["outage"]["raw_pending_alerts"] == 0
+    assert empty_batch_result["outage"]["filtered_pending_alerts"] == 0
+    assert empty_batch_result["outage"]["marked_sent_alerts"] == 0
+
+    assert next_batch_result["outage"]["raw_pending_alerts"] == 1
+    assert next_batch_result["outage"]["filtered_pending_alerts"] == 1
+    assert next_batch_result["outage"]["filtered_out_alerts"] == 0
+    assert next_batch_result["outage"]["marked_sent_alerts"] == 1
+
+
 def test_dispatch_batch_notifications_skips_individual_alerts_when_disabled(repo_paths, monkeypatch):
     repo, _measurement_db = repo_paths
 
@@ -429,6 +645,133 @@ def test_dispatch_batch_notifications_skips_individual_alerts_when_disabled(repo
     assert result["outage"]["filtered_out_alerts"] == 1
     assert result["outage"]["marked_sent_alerts"] == 0
     assert any("individual outage notifications disabled by config" in message for message in messages)
+
+
+def test_dispatch_batch_notifications_filters_current_off_rows_by_today_cutoff(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_rows = [
+        {
+            "batch_id": "b2",
+            "ma_tb": "OLD",
+            "ten_tb": "Old TB",
+            "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+            "ten_nvkt_db": "VNPT - Nguyen Van A",
+            "dienthoai_lh": "0912345678",
+            "diachi_ld": "Dia chi",
+            "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+            "first_off_time": "2026-04-26T05:59:00",
+            "duration_minutes": 25,
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+        },
+        {
+            "batch_id": "b2",
+            "ma_tb": "KEEP",
+            "ten_tb": "Keep TB",
+            "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+            "ten_nvkt_db": "VNPT - Nguyen Van A",
+            "dienthoai_lh": "0912345678",
+            "diachi_ld": "Dia chi",
+            "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:2",
+            "first_off_time": "2026-04-26T06:01:00",
+            "duration_minutes": 25,
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+        },
+    ]
+
+    monkeypatch.setattr(notification_bridge, "load_current_off_snapshot_rows", lambda repo, batch_id: snapshot_rows)
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+            "current_off_alert_start_time": "06:00",
+        },
+    )
+    original_filter = notification_bridge.notification_service.filter_current_off_alerts_by_cutoff
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "filter_current_off_alerts_by_cutoff",
+        lambda alerts, config=None, now=None: original_filter(
+            alerts,
+            config=config,
+            now=datetime(2026, 4, 26, 7, 30, 0),
+        ),
+    )
+
+    messages = []
+    result = dispatch_batch_notifications(repo, "b2", log=messages.append)
+
+    assert result["outage"]["raw_pending_alerts"] == 2
+    assert result["outage"]["filtered_pending_alerts"] == 1
+    assert result["outage"]["filtered_out_alerts"] == 1
+    assert result["outage"]["marked_sent_alerts"] == 1
+    assert any("individual outage cutoff=" in message and "filtered_by_cutoff=1" in message for message in messages)
+
+
+def test_dispatch_batch_notifications_excludes_suppressed_current_off_rows(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_rows = [
+        {
+            "batch_id": "b2",
+            "ma_tb": "SUPPRESS",
+            "ten_tb": "Suppressed TB",
+            "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+            "ten_nvkt_db": "VNPT - Nguyen Van A",
+            "dienthoai_lh": "0912345678",
+            "diachi_ld": "Dia chi",
+            "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+            "first_off_time": "2026-04-26T06:01:00",
+            "duration_minutes": 25,
+            "suppressed_by_pattern": True,
+            "suppressed_by_wide_area": False,
+        },
+        {
+            "batch_id": "b2",
+            "ma_tb": "KEEP",
+            "ten_tb": "Keep TB",
+            "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+            "ten_nvkt_db": "VNPT - Nguyen Van A",
+            "dienthoai_lh": "0912345678",
+            "diachi_ld": "Dia chi",
+            "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:2",
+            "first_off_time": "2026-04-26T06:02:00",
+            "duration_minutes": 25,
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+        },
+    ]
+
+    monkeypatch.setattr(notification_bridge, "load_current_off_snapshot_rows", lambda repo, batch_id: snapshot_rows)
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+        },
+    )
+
+    result = dispatch_batch_notifications(repo, "b2", log=lambda _message: None)
+
+    assert result["outage"]["raw_pending_alerts"] == 2
+    assert result["outage"]["filtered_pending_alerts"] == 1
+    assert result["outage"]["filtered_out_alerts"] == 1
+    assert result["outage"]["marked_sent_alerts"] == 1
 
 
 def test_dispatch_batch_notifications_skips_wide_area_alerts_outside_time_window(repo_paths, monkeypatch):
@@ -541,6 +884,71 @@ def test_dispatch_batch_notifications_skips_excluded_wide_area_ports_but_keeps_d
     assert result["wide_area"]["excluded_by_config"] == 1
     assert result["wide_area"]["marked_sent_alerts"] == 1
     assert any("wide-area excluded_by_config=1 ports=STY.G22:0-1-13" in message for message in messages)
+
+    with sqlite3.connect(measurement_db) as conn:
+        row = conn.execute(
+            "SELECT id, notification_sent FROM wide_area_alerts WHERE id = ?",
+            (inserted_id,),
+        ).fetchone()
+
+    assert row[0] == inserted_id
+    assert row[1] == 1
+
+
+def test_dispatch_batch_notifications_skips_small_port_down_alerts_but_marks_sent(repo_paths, monkeypatch):
+    repo, measurement_db = repo_paths
+
+    inserted_id = repo.insert_wide_area_alert(
+        WideAreaAlert(
+            batch_id="b1",
+            parent_port_key="HNI.BVI.BVI.OLT.AL.2.1_1-1-2",
+            olt_name="HNI.BVI.BVI.OLT.AL.2.1",
+            port="1-1-2",
+            subscriber_count=2,
+            incident_type="port_down",
+            subscriber_keys=["HNI.BVI.BVI.OLT.AL.2.1_1-1-2:1"],
+            subscriber_list=[{"ma_tb": "TB001", "ten_tb": "Ten TB", "ten_nvkt_db": "VNPT - Nguyen Van A"}],
+            doi_vt="Tổ Kỹ thuật Địa bàn Quảng Oai",
+            alert_time=datetime(2026, 4, 24, 12, 30, 0),
+        )
+    )
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("small port_down alert should not be sent")
+
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "send_telegram_message",
+        fail_if_called,
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "send_zalo_message_to_thread_detailed",
+        fail_if_called,
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": True,
+            "enable_zalo": True,
+            "enable_wide_area_alert_notifications": True,
+        },
+    )
+
+    messages = []
+    result = dispatch_batch_notifications(repo, "b1", log=messages.append)
+
+    assert result["wide_area"]["pending_alerts"] == 1
+    assert result["wide_area"]["marked_sent_alerts"] == 1
+    assert result["wide_area"]["telegram_sent"] is False
+    assert result["wide_area"]["zalo_messages_sent"] == 0
+    assert any("port_down_below_threshold=1" in message for message in messages)
 
     with sqlite3.connect(measurement_db) as conn:
         row = conn.execute(

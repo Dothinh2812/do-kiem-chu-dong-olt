@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import threading
 import unicodedata
+import csv
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict, deque
@@ -33,9 +34,11 @@ AUTH_RETRY_STATUS_CODES = {401, 403}
 MAX_HTTP_500_RETRIES = 2
 MAX_TIMEOUT_RETRIES = 3
 TIMEOUT_SEQUENCE_SECONDS = [15, 30, 60]  # Increasing timeouts for each retry attempt
-MEASUREMENT_LOOP_DELAY_SECONDS = 25
+MEASUREMENT_LOOP_DELAY_SECONDS = 300
 DATABASE_PATH = "onu_measurements.db"
 SOURCE_DATABASE_PATH = "database.db"
+MEASUREMENT_LOG_DIR = Path("logs/measurement_batches")
+PORT_STATUS_OUTPUT_DIR = Path("runtime")
 TABLE_NAME = "onu_measurements"
 PORT_LABEL_COLUMN = "Cổng"
 MEASUREMENT_COLUMNS = [
@@ -69,13 +72,17 @@ global_cookies = {}
 global_headers = {}
 login_lock = threading.Lock()
 db_lock = threading.Lock()
+issue_log_lock = threading.Lock()
+port_status_cache_lock = threading.Lock()
 device_semaphores = {}
 ip_to_olt_name = {}
 allowed_subs = set()
+port_status_slot_cache = {}
 
 OLT_TEXT_DATA = """HNI.TTT.THH.OLT.HU.6.1	MA5801-GP8	10.10.60.106
 HNI.BVI.PCG.OLT.HU.6.1	MA5801-GP8	10.10.60.114
 HNI.BVI.PTH.OLT.HU.6.1	MA5801-GP8	10.10.60.115
+HNI.BVI.DAC.OLT.HU.6.1	MA5801-GP8	10.10.60.186
 HNI.PTO.LBQ.OLT.HU.6.1	MA5801-GP8	10.10.60.171
 HNI.PTO.NPO.OLT.HU.6.1	MA5801-GP8	10.10.60.172
 HNI.PTO.NHM.OLT.HU.6.1	MA5801-GP8	10.10.60.173
@@ -102,6 +109,7 @@ HNI.TTT.CNU.OLT.HU.2.2	MA5608T	10.31.17.181
 HNI.TTT.LIT.OLT.HU.2.1	MA5608T	10.31.17.182
 HNI.TTT.DID.OLT.HU.2.1	MA5608T	10.31.17.183
 HNI.TTT.LIT.OLT.HU.2.2	MA5608T	10.31.17.184
+HNI.TTT.HLC.OLT.ZT.1.2	MA5608T	10.31.8.147
 HNI.TTT.TTT.OLT.HU.4.3	MA5800X7	10.31.17.185
 HNI.TTT.BPU.OLT.HU.1.1	MA5600T	10.31.17.242
 HNI.TTT.BPU.OLT.HU.2.2	MA5608T	10.31.17.243
@@ -178,6 +186,7 @@ HNI.DPG.LNT.OLT.ZT.1.2	ZTEC320	10.31.9.23
 HNI.DPG.LNG.OLT.ZT.1.3	ZTEC320	10.31.9.24
 HNI.DPG.THI.OLT.HU.4.1	MA5800X7	10.31.9.242"""
 PORT_PATTERN = re.compile(r"_(\d+(?:-\d+){2}):")
+PORT_STATUS_NO_PATTERN = re.compile(r"(\d+)/(\d+)/(\d+)$")
 
 
 def extract_port(sub_value):
@@ -245,6 +254,160 @@ def parse_olt_ip_map():
         if len(parts) >= 3:
             ip_map[parts[0]] = parts[2]
     return ip_map
+
+
+def build_port_status_slot_tasks(port_tasks):
+    """
+    Collapse per-port scan tasks into unique per-slot tasks for GetL2PortListBySlot.
+    """
+    slot_tasks = []
+    seen = set()
+
+    for task in port_tasks:
+        slot_task = {
+            "deviceIp": str(task.get("deviceIp", "")).strip(),
+            "frame": str(task.get("frame", "")).strip(),
+            "slot": str(task.get("slot", "")).strip(),
+            "olt_name": str(task.get("olt_name", "")).strip(),
+        }
+        task_key = (slot_task["deviceIp"], slot_task["frame"], slot_task["slot"])
+        if not all(task_key) or task_key in seen:
+            continue
+        seen.add(task_key)
+        slot_tasks.append(slot_task)
+
+    return slot_tasks
+
+
+def _extract_port_numbers(raw_value):
+    match = PORT_STATUS_NO_PATTERN.search(str(raw_value or "").strip())
+    if not match:
+        return None, None, None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def normalize_port_status_row(slot_task, row):
+    """
+    Convert one GetL2PortListBySlot payload row into a stable dictionary.
+    """
+    slot_no = str(row.get("slotNo", "") or "").strip()
+    if_name = str(row.get("ifName", "") or "").strip()
+
+    frame, slot, port = _extract_port_numbers(slot_no)
+    if not port:
+        frame, slot, port = _extract_port_numbers(if_name)
+    if not frame:
+        frame = str(slot_task.get("frame", "") or "").strip()
+    if not slot:
+        slot = str(slot_task.get("slot", "") or "").strip()
+
+    return {
+        "olt_name": str(slot_task.get("olt_name", "") or "").strip(),
+        "device_ip": str(slot_task.get("deviceIp", "") or "").strip(),
+        "frame": frame,
+        "slot": slot,
+        "port": port or "",
+        "slot_no": slot_no,
+        "if_name": if_name,
+        "if_status": str(row.get("ifStatus", "") or "").strip(),
+        "if_descr": str(row.get("ifDescr", "") or "").strip(),
+        "key": str(row.get("key", "") or "").strip(),
+        "tx": row.get("tx"),
+        "tx_xgspon": row.get("txXgspon"),
+    }
+
+
+def fetch_port_status_for_slot(slot_task):
+    """
+    Request all L2 port statuses for one OLT slot and return normalized rows.
+    """
+    data_url = "https://cts.vnpt.vn/Linetest/Test/GetL2PortListBySlot"
+    params = {
+        "deviceIp": slot_task.get("deviceIp"),
+        "frame": "-1",
+        "slot": slot_task.get("slot"),
+    }
+
+    with login_lock:
+        current_cookies = global_cookies.copy()
+        current_headers = global_headers.copy()
+
+    res = requests.get(
+        data_url,
+        params=params,
+        headers=current_headers,
+        cookies=current_cookies,
+        timeout=30,
+    )
+    res.raise_for_status()
+
+    content_type = res.headers.get("content-type", "").lower()
+    if "application/json" not in content_type:
+        body_preview = str(getattr(res, "text", "") or "").strip().replace("\n", " ")[:200]
+        raise RuntimeError(
+            "GetL2PortListBySlot returned non-JSON response. "
+            "This usually means the CTS session is missing or expired. "
+            "Run perform_browser_login() first or use the CLI with --login. "
+            f"HTTP {res.status_code}, content-type={content_type}, body={body_preview!r}"
+        )
+
+    rows = res.json()
+    if not isinstance(rows, list):
+        raise ValueError("Expected list payload from GetL2PortListBySlot")
+
+    return [normalize_port_status_row(slot_task, row) for row in rows]
+
+
+def scan_all_olt_port_statuses(port_tasks=None):
+    """
+    Scan all unique OLT slots and return normalized L2 port statuses.
+    This function is intentionally standalone and is not wired into the
+    continuous ONU measurement loop.
+    """
+    if port_tasks is None:
+        port_tasks = prepare_input_files()
+
+    slot_tasks = build_port_status_slot_tasks(port_tasks)
+    all_rows = []
+    for slot_task in slot_tasks:
+        all_rows.extend(fetch_port_status_for_slot(slot_task))
+    return all_rows
+
+
+def export_port_status_snapshot(rows, output_dir=PORT_STATUS_OUTPUT_DIR):
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_path / "port_status_snapshot.json"
+    csv_path = output_path / "port_status_snapshot.csv"
+    json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    fieldnames = [
+        "olt_name",
+        "device_ip",
+        "frame",
+        "slot",
+        "port",
+        "slot_no",
+        "if_name",
+        "if_status",
+        "if_descr",
+        "key",
+        "tx",
+        "tx_xgspon",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.DictWriter(file_obj, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return json_path, csv_path
+
+
+def scan_and_export_all_olt_port_statuses(port_tasks=None, output_dir=PORT_STATUS_OUTPUT_DIR):
+    rows = scan_all_olt_port_statuses(port_tasks=port_tasks)
+    json_path, csv_path = export_port_status_snapshot(rows, output_dir=output_dir)
+    return rows, json_path, csv_path
 
 
 def prepare_input_files():
@@ -372,6 +535,161 @@ def resolve_olt_name(task):
     if olt_name:
         return olt_name
     return ip_to_olt_name.get(task.get("deviceIp"), "UNKNOWN")
+
+
+def build_task_port_label(task):
+    return f"{task.get('deviceIp')}_F{task.get('frame')}_S{task.get('slot')}_P{task.get('port')}"
+
+
+def build_parent_port_key(olt_name, frame_no, slot_no, port_no):
+    return f"{olt_name}_{frame_no}-{slot_no}-{port_no}"
+
+
+def parse_subscriber_key(subscriber_key):
+    olt_name, rest = str(subscriber_key).split("_", 1)
+    port_part, onu_index = rest.split(":", 1)
+    frame_no, slot_no, port_no = [int(part) for part in port_part.split("-")]
+    return olt_name, frame_no, slot_no, port_no, int(onu_index)
+
+
+def lookup_subscribers_by_parent_port(source_db_path, parent_port_key):
+    with sqlite3.connect(source_db_path, timeout=60) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT
+                sub AS subscriber_key,
+                COALESCE(Ma_Tb, '') AS ma_tb,
+                COALESCE(Ten_Tb, '') AS ten_tb,
+                COALESCE(Ma_Men, '') AS ma_men,
+                COALESCE(DOI_VT, '') AS doi_vt,
+                COALESCE(DIACHI_LD, '') AS diachi_ld,
+                COALESCE(DIENTHOAI_LH, '') AS dienthoai_lh,
+                COALESCE(TEN_NVKT_DB, '') AS ten_nvkt_db
+            FROM danhba
+            WHERE sub LIKE ?
+            ORDER BY sub
+            """,
+            (f"{parent_port_key}:%",),
+        ).fetchall()
+
+    subscribers = []
+    for row in rows:
+        item = dict(row)
+        _olt_name, _frame_no, _slot_no, _port_no, onu_index = parse_subscriber_key(item["subscriber_key"])
+        item["onu_index"] = onu_index
+        item["account_fiber"] = ""
+        subscribers.append(item)
+    return subscribers
+
+
+def build_port_down_measurement_records(subscriber_rows, batch_id, measured_date, measured_time):
+    records = []
+    for row in subscriber_rows:
+        _olt_name, frame_no, slot_no, port_no, onu_index = parse_subscriber_key(row["subscriber_key"])
+        records.append(
+            (
+                row["subscriber_key"],
+                batch_id,
+                "",
+                "",
+                None,
+                None,
+                "",
+                "",
+                "",
+                "PORT_DOWN",
+                frame_no,
+                slot_no,
+                port_no,
+                onu_index,
+                row.get("account_fiber", "") or "",
+                measured_date,
+                measured_time,
+            )
+        )
+    return records
+
+
+def _fetch_port_status_rows(task):
+    cache_key = (str(task.get("deviceIp", "")).strip(), str(task.get("slot", "")).strip())
+    with port_status_cache_lock:
+        cached = port_status_slot_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    data_url = "https://cts.vnpt.vn/Linetest/Test/GetL2PortListBySlot"
+    params = {
+        "deviceIp": task.get("deviceIp"),
+        "frame": "-1",
+        "slot": task.get("slot"),
+    }
+
+    with login_lock:
+        current_cookies = global_cookies.copy()
+        current_headers = global_headers.copy()
+
+    res = requests.get(
+        data_url,
+        params=params,
+        headers=current_headers,
+        cookies=current_cookies,
+        timeout=30,
+    )
+    content_type = res.headers.get("content-type", "").lower()
+    if "text/html" in content_type or res.status_code in AUTH_RETRY_STATUS_CODES:
+        raise RuntimeError(f"Port status request rejected: HTTP {res.status_code}, content-type={content_type}")
+
+    raise_for_status = getattr(res, "raise_for_status", None)
+    if callable(raise_for_status):
+        raise_for_status()
+    rows = res.json()
+    if not isinstance(rows, list):
+        raise ValueError("Expected list payload from GetL2PortListBySlot")
+
+    with port_status_cache_lock:
+        port_status_slot_cache[cache_key] = rows
+    return rows
+
+
+def fetch_single_port_status(task):
+    target_slot_no = f"{task.get('frame')}/{task.get('slot')}/{task.get('port')}"
+    for row in _fetch_port_status_rows(task):
+        slot_no = str(row.get("slotNo", "") or "").strip()
+        if slot_no == target_slot_no:
+            return str(row.get("ifStatus", "") or "").strip()
+    return ""
+
+
+def get_batch_issue_log_path(batch_id):
+    return Path(MEASUREMENT_LOG_DIR) / f"{batch_id}_port_issues.csv"
+
+
+def append_port_issue_log(batch_id, task, status, reason, olt_name=None):
+    log_path = get_batch_issue_log_path(batch_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    row = {
+        "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "batch_id": batch_id,
+        "status": status,
+        "olt_name": olt_name or resolve_olt_name(task),
+        "device_ip": str(task.get("deviceIp", "") or ""),
+        "frame": str(task.get("frame", "") or ""),
+        "slot": str(task.get("slot", "") or ""),
+        "port": str(task.get("port", "") or ""),
+        "port_label": build_task_port_label(task),
+        "reason": reason,
+    }
+    fieldnames = list(row.keys())
+
+    with issue_log_lock:
+        file_exists = log_path.exists()
+        with log_path.open("a", encoding="utf-8", newline="") as file_obj:
+            writer = csv.DictWriter(file_obj, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
 
 
 def build_port_label(olt_name, row):
@@ -606,7 +924,7 @@ def download_single_port(idx, total_ports, task, batch_id):
     s_idx = task.get("slot")
     p_idx = task.get("port")
 
-    port_label = f"{ip}_F{f_idx}_S{s_idx}_P{p_idx}"
+    port_label = build_task_port_label(task)
     data_url = "https://cts.vnpt.vn/Linetest/Test/GetListByPonPortAsync"
     params = {"deviceIp": ip, "frame": f_idx, "slot": s_idx, "port": p_idx}
     server_error_retries = 0
@@ -615,6 +933,52 @@ def download_single_port(idx, total_ports, task, batch_id):
     device_semaphore = device_semaphores[ip]
     with device_semaphore:
         while True:
+            port_status = ""
+            try:
+                port_status = fetch_single_port_status(task)
+            except Exception as exc:
+                append_port_issue_log(
+                    batch_id,
+                    task,
+                    "warning",
+                    f"Port status precheck failed, falling back to ONU detail: {exc}",
+                    olt_name=olt_name,
+                )
+
+            if str(port_status).upper() == "DOWN":
+                subscriber_rows = lookup_subscribers_by_parent_port(
+                    SOURCE_DATABASE_PATH,
+                    build_parent_port_key(olt_name, f_idx, s_idx, p_idx),
+                )
+                if not subscriber_rows:
+                    append_port_issue_log(
+                        batch_id,
+                        task,
+                        "filtered",
+                        "Port Down but no subscribers found in danhba",
+                        olt_name=olt_name,
+                    )
+                    return "filtered"
+
+                measured_at = datetime.now()
+                measured_date = measured_at.strftime("%Y-%m-%d")
+                measured_time = measured_at.strftime("%H:%M:%S")
+                records = build_port_down_measurement_records(
+                    subscriber_rows,
+                    batch_id,
+                    measured_date,
+                    measured_time,
+                )
+                insert_measurement_records(records)
+                append_port_issue_log(
+                    batch_id,
+                    task,
+                    "port_down",
+                    f"Port Down precheck created {len(records)} PORT_DOWN rows",
+                    olt_name=olt_name,
+                )
+                return "port_down"
+
             with login_lock:
                 current_cookies = global_cookies.copy()
                 current_headers = global_headers.copy()
@@ -660,6 +1024,13 @@ def download_single_port(idx, total_ports, task, batch_id):
                         data = res.json()
                     except Exception:
                         print(f"[{idx}/{total_ports}] Invalid JSON response. Skipping {port_label}.")
+                        append_port_issue_log(
+                            batch_id,
+                            task,
+                            "error",
+                            "Invalid JSON response from CTS API",
+                            olt_name=olt_name,
+                        )
                         return "error"
 
                     if not data:
@@ -677,10 +1048,12 @@ def download_single_port(idx, total_ports, task, batch_id):
                         measured_time,
                     )
                     if not records:
+                        reason = "No matching danhba.sub entries for CTS payload"
                         print(
                             f"[{idx}/{total_ports}] No matching danhba.sub entries for {port_label}. "
                             "Nothing was saved."
                         )
+                        append_port_issue_log(batch_id, task, "filtered", reason, olt_name=olt_name)
                         return "filtered"
 
                     insert_measurement_records(records)
@@ -702,9 +1075,23 @@ def download_single_port(idx, total_ports, task, batch_id):
                         continue
 
                     print(f"[{idx}/{total_ports}] HTTP 500 for port after retries: {port_label}")
+                    append_port_issue_log(
+                        batch_id,
+                        task,
+                        "error",
+                        f"HTTP 500 after {MAX_HTTP_500_RETRIES} retries",
+                        olt_name=olt_name,
+                    )
                     return "error_500"
 
                 print(f"[{idx}/{total_ports}] HTTP {res.status_code} rejected: {port_label}")
+                append_port_issue_log(
+                    batch_id,
+                    task,
+                    "error",
+                    f"HTTP {res.status_code} rejected by CTS API",
+                    olt_name=olt_name,
+                )
                 return "error"
 
             except requests.exceptions.Timeout:
@@ -718,6 +1105,13 @@ def download_single_port(idx, total_ports, task, batch_id):
                     continue
 
                 print(f"[{idx}/{total_ports}] Timeout after retries: {port_label}")
+                append_port_issue_log(
+                    batch_id,
+                    task,
+                    "error",
+                    f"Timeout after {MAX_TIMEOUT_RETRIES} attempts",
+                    olt_name=olt_name,
+                )
                 return "timeout"
             except Exception as exc:
                 print(f"[{idx}/{total_ports}] Network error for {port_label}: {exc}")
@@ -730,6 +1124,8 @@ def run_measurement_cycle(tasks, cycle_no):
     """
     total_ports = len(tasks)
     stats = {"success": 0, "empty": 0, "filtered": 0, "error": 0}
+    with port_status_cache_lock:
+        port_status_slot_cache.clear()
     cycle_started_dt = datetime.now()
     cycle_started_at = cycle_started_dt.strftime("%Y-%m-%d %H:%M:%S")
     batch_id = cycle_started_dt.strftime("%Y%m%d%H%M")
@@ -758,7 +1154,7 @@ def run_measurement_cycle(tasks, cycle_no):
                 stats["error"] += 1
                 continue
 
-            if res_status == "success":
+            if res_status in {"success", "port_down"}:
                 stats["success"] += 1
             elif res_status == "empty":
                 stats["empty"] += 1
@@ -815,6 +1211,7 @@ def run_measurement_cycle(tasks, cycle_no):
         )
         print(
             f"[ALERT]   outage_created={alert_results.get('outage_alerts_created', 0)} "
+            f"customer_poweroff_suppressed={alert_results.get('customer_poweroff_suppressed_count', 0)} "
             f"pending_after_filters={outage.get('filtered_pending_alerts', 0)} "
             f"marked_sent={outage.get('marked_sent_alerts', 0)} "
             f"zalo_groups_sent={outage.get('zalo_groups_sent', 0)} "

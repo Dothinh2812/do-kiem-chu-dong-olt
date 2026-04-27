@@ -26,6 +26,11 @@ def _iso(value):
     return str(value)
 
 
+def _chunks(values: Sequence, size: int = 900):
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
 class AlertRepository:
     def __init__(self, db_path: str, source_db_path: str):
         self.db_path = str(db_path)
@@ -35,6 +40,15 @@ class AlertRepository:
         conn = sqlite3.connect(self.db_path, timeout=60)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _ensure_column(self, conn, table_name: str, column_name: str, definition: str):
+        existing_columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name in existing_columns:
+            return
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
     def ensure_schema(self):
         with self.connect() as conn:
@@ -148,6 +162,12 @@ class AlertRepository:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_recovery_alerts_subscriber_outage
+                ON recovery_alerts(subscriber_key, outage_time)
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS wide_area_alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     batch_id TEXT NOT NULL,
@@ -155,15 +175,21 @@ class AlertRepository:
                     olt_name TEXT NOT NULL,
                     port TEXT NOT NULL,
                     subscriber_count INTEGER NOT NULL,
+                    incident_type TEXT DEFAULT 'wide_area',
                     subscriber_keys_json TEXT NOT NULL,
                     subscriber_summary_json TEXT NOT NULL,
                     doi_vt TEXT,
                     alert_time DATETIME NOT NULL,
+                    first_off_time DATETIME,
+                    off_duration_minutes INTEGER DEFAULT 0,
                     notification_sent BOOLEAN DEFAULT FALSE,
                     notification_time DATETIME
                 )
                 """
             )
+            self._ensure_column(conn, "wide_area_alerts", "first_off_time", "DATETIME")
+            self._ensure_column(conn, "wide_area_alerts", "off_duration_minutes", "INTEGER DEFAULT 0")
+            self._ensure_column(conn, "wide_area_alerts", "incident_type", "TEXT DEFAULT 'wide_area'")
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_wide_area_alerts_batch_port
@@ -188,6 +214,15 @@ class AlertRepository:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_exclusion_active ON pattern_exclusion_list(is_active)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_runtime_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
             conn.commit()
 
@@ -328,102 +363,103 @@ class AlertRepository:
             ).fetchone()
             return dict(row) if row else None
 
+    def fetch_state_map(self, subscriber_keys: Sequence[str]) -> Dict[str, Dict]:
+        unique_keys = sorted(set(key for key in subscriber_keys if key))
+        if not unique_keys:
+            return {}
+
+        rows = []
+        with self.connect() as conn:
+            for key_chunk in _chunks(unique_keys):
+                placeholders = ",".join("?" for _ in key_chunk)
+                rows.extend(
+                    conn.execute(
+                        f"""
+                        SELECT *
+                        FROM subscriber_status_state
+                        WHERE subscriber_key IN ({placeholders})
+                        """,
+                        tuple(key_chunk),
+                    ).fetchall()
+                )
+        return {row["subscriber_key"]: dict(row) for row in rows}
+
+    def _state_params(self, state: Dict) -> tuple:
+        return (
+            state["subscriber_key"],
+            state["parent_port_key"],
+            state.get("ma_tb", ""),
+            state.get("ten_tb", ""),
+            state.get("ma_men", ""),
+            state.get("olt_name", ""),
+            state.get("doi_vt", ""),
+            state.get("diachi_ld", ""),
+            state.get("dienthoai_lh", ""),
+            state.get("ten_nvkt_db", ""),
+            state.get("account_fiber", ""),
+            state["current_state"],
+            state.get("last_status", ""),
+            state.get("consecutive_on_count", 0),
+            state.get("consecutive_off_count", 0),
+            _iso(state.get("first_on_time")),
+            _iso(state.get("first_off_time")),
+            _iso(state.get("alert_sent_time")),
+            _iso(state.get("recovery_sent_time")),
+            state.get("last_batch_id", ""),
+            _iso(state.get("last_measure_time")),
+        )
+
+    def _save_state_sql(self) -> str:
+        return """
+            INSERT INTO subscriber_status_state (
+                subscriber_key, parent_port_key, ma_tb, ten_tb, ma_men, olt_name,
+                doi_vt, diachi_ld, dienthoai_lh, ten_nvkt_db, account_fiber,
+                current_state, last_status, consecutive_on_count, consecutive_off_count,
+                first_on_time, first_off_time, alert_sent_time, recovery_sent_time,
+                last_batch_id, last_measure_time, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(subscriber_key) DO UPDATE SET
+                parent_port_key = excluded.parent_port_key,
+                ma_tb = excluded.ma_tb,
+                ten_tb = excluded.ten_tb,
+                ma_men = excluded.ma_men,
+                olt_name = excluded.olt_name,
+                doi_vt = excluded.doi_vt,
+                diachi_ld = excluded.diachi_ld,
+                dienthoai_lh = excluded.dienthoai_lh,
+                ten_nvkt_db = excluded.ten_nvkt_db,
+                account_fiber = excluded.account_fiber,
+                current_state = excluded.current_state,
+                last_status = excluded.last_status,
+                consecutive_on_count = excluded.consecutive_on_count,
+                consecutive_off_count = excluded.consecutive_off_count,
+                first_on_time = excluded.first_on_time,
+                first_off_time = excluded.first_off_time,
+                alert_sent_time = excluded.alert_sent_time,
+                recovery_sent_time = excluded.recovery_sent_time,
+                last_batch_id = excluded.last_batch_id,
+                last_measure_time = excluded.last_measure_time,
+                updated_at = CURRENT_TIMESTAMP
+            """
+
     def save_state(self, state: Dict):
         with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO subscriber_status_state (
-                    subscriber_key, parent_port_key, ma_tb, ten_tb, ma_men, olt_name,
-                    doi_vt, diachi_ld, dienthoai_lh, ten_nvkt_db, account_fiber,
-                    current_state, last_status, consecutive_on_count, consecutive_off_count,
-                    first_on_time, first_off_time, alert_sent_time, recovery_sent_time,
-                    last_batch_id, last_measure_time, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(subscriber_key) DO UPDATE SET
-                    parent_port_key = excluded.parent_port_key,
-                    ma_tb = excluded.ma_tb,
-                    ten_tb = excluded.ten_tb,
-                    ma_men = excluded.ma_men,
-                    olt_name = excluded.olt_name,
-                    doi_vt = excluded.doi_vt,
-                    diachi_ld = excluded.diachi_ld,
-                    dienthoai_lh = excluded.dienthoai_lh,
-                    ten_nvkt_db = excluded.ten_nvkt_db,
-                    account_fiber = excluded.account_fiber,
-                    current_state = excluded.current_state,
-                    last_status = excluded.last_status,
-                    consecutive_on_count = excluded.consecutive_on_count,
-                    consecutive_off_count = excluded.consecutive_off_count,
-                    first_on_time = excluded.first_on_time,
-                    first_off_time = excluded.first_off_time,
-                    alert_sent_time = excluded.alert_sent_time,
-                    recovery_sent_time = excluded.recovery_sent_time,
-                    last_batch_id = excluded.last_batch_id,
-                    last_measure_time = excluded.last_measure_time,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    state["subscriber_key"],
-                    state["parent_port_key"],
-                    state.get("ma_tb", ""),
-                    state.get("ten_tb", ""),
-                    state.get("ma_men", ""),
-                    state.get("olt_name", ""),
-                    state.get("doi_vt", ""),
-                    state.get("diachi_ld", ""),
-                    state.get("dienthoai_lh", ""),
-                    state.get("ten_nvkt_db", ""),
-                    state.get("account_fiber", ""),
-                    state["current_state"],
-                    state.get("last_status", ""),
-                    state.get("consecutive_on_count", 0),
-                    state.get("consecutive_off_count", 0),
-                    _iso(state.get("first_on_time")),
-                    _iso(state.get("first_off_time")),
-                    _iso(state.get("alert_sent_time")),
-                    _iso(state.get("recovery_sent_time")),
-                    state.get("last_batch_id", ""),
-                    _iso(state.get("last_measure_time")),
-                ),
+            conn.execute(self._save_state_sql(), self._state_params(state))
+            conn.commit()
+
+    def save_states_bulk(self, states: Sequence[Dict]):
+        if not states:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                self._save_state_sql(),
+                [self._state_params(state) for state in states],
             )
             conn.commit()
 
     def insert_outage_alert(self, alert: OutageAlert) -> Optional[int]:
         with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO outage_alerts (
-                    subscriber_key, parent_port_key, batch_id, ma_tb, ten_tb, ma_men,
-                    olt_name, doi_vt, diachi_ld, dienthoai_lh, ten_nvkt_db,
-                    first_on_time, first_off_time, alert_time, off_duration_minutes,
-                    consecutive_on_count, notification_sent, notification_time,
-                    suppressed_by_pattern, suppressed_by_wide_area, suppression_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    alert.subscriber_key,
-                    alert.parent_port_key,
-                    alert.batch_id,
-                    alert.ma_tb,
-                    alert.ten_tb,
-                    alert.ma_men,
-                    alert.olt_name,
-                    alert.doi_vt,
-                    alert.diachi_ld,
-                    alert.dienthoai_lh,
-                    alert.ten_nvkt_db,
-                    _iso(alert.first_on_time),
-                    _iso(alert.first_off_time),
-                    _iso(alert.alert_time),
-                    alert.off_duration_minutes,
-                    alert.consecutive_on_count,
-                    int(alert.notification_sent),
-                    _iso(alert.notification_time),
-                    int(alert.suppressed_by_pattern),
-                    int(alert.suppressed_by_wide_area),
-                    alert.suppression_reason,
-                ),
-            )
+            cursor = conn.execute(self._insert_outage_alert_sql(), self._outage_alert_params(alert))
             conn.commit()
             if cursor.lastrowid:
                 return cursor.lastrowid
@@ -433,35 +469,55 @@ class AlertRepository:
             ).fetchone()
             return row["id"] if row else None
 
+    def _insert_outage_alert_sql(self) -> str:
+        return """
+            INSERT OR IGNORE INTO outage_alerts (
+                subscriber_key, parent_port_key, batch_id, ma_tb, ten_tb, ma_men,
+                olt_name, doi_vt, diachi_ld, dienthoai_lh, ten_nvkt_db,
+                first_on_time, first_off_time, alert_time, off_duration_minutes,
+                consecutive_on_count, notification_sent, notification_time,
+                suppressed_by_pattern, suppressed_by_wide_area, suppression_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+
+    def _outage_alert_params(self, alert: OutageAlert) -> tuple:
+        return (
+            alert.subscriber_key,
+            alert.parent_port_key,
+            alert.batch_id,
+            alert.ma_tb,
+            alert.ten_tb,
+            alert.ma_men,
+            alert.olt_name,
+            alert.doi_vt,
+            alert.diachi_ld,
+            alert.dienthoai_lh,
+            alert.ten_nvkt_db,
+            _iso(alert.first_on_time),
+            _iso(alert.first_off_time),
+            _iso(alert.alert_time),
+            alert.off_duration_minutes,
+            alert.consecutive_on_count,
+            int(alert.notification_sent),
+            _iso(alert.notification_time),
+            int(alert.suppressed_by_pattern),
+            int(alert.suppressed_by_wide_area),
+            alert.suppression_reason,
+        )
+
+    def insert_outage_alerts_bulk(self, alerts: Sequence[OutageAlert]):
+        if not alerts:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                self._insert_outage_alert_sql(),
+                [self._outage_alert_params(alert) for alert in alerts],
+            )
+            conn.commit()
+
     def insert_recovery_alert(self, alert: RecoveryAlert) -> Optional[int]:
         with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO recovery_alerts (
-                    subscriber_key, parent_port_key, batch_id, ma_tb, ten_tb, olt_name,
-                    doi_vt, diachi_ld, dienthoai_lh, ten_nvkt_db,
-                    outage_time, recovery_time, outage_duration_minutes,
-                    notification_sent, notification_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    alert.subscriber_key,
-                    alert.parent_port_key,
-                    alert.batch_id,
-                    alert.ma_tb,
-                    alert.ten_tb,
-                    alert.olt_name,
-                    alert.doi_vt,
-                    alert.diachi_ld,
-                    alert.dienthoai_lh,
-                    alert.ten_nvkt_db,
-                    _iso(alert.outage_time),
-                    _iso(alert.recovery_time),
-                    alert.outage_duration_minutes,
-                    int(alert.notification_sent),
-                    _iso(alert.notification_time),
-                ),
-            )
+            cursor = conn.execute(self._insert_recovery_alert_sql(), self._recovery_alert_params(alert))
             conn.commit()
             if cursor.lastrowid:
                 return cursor.lastrowid
@@ -471,15 +527,81 @@ class AlertRepository:
             ).fetchone()
             return row["id"] if row else None
 
+    def _insert_recovery_alert_sql(self) -> str:
+        return """
+            INSERT OR IGNORE INTO recovery_alerts (
+                subscriber_key, parent_port_key, batch_id, ma_tb, ten_tb, olt_name,
+                doi_vt, diachi_ld, dienthoai_lh, ten_nvkt_db,
+                outage_time, recovery_time, outage_duration_minutes,
+                notification_sent, notification_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+
+    def _recovery_alert_params(self, alert: RecoveryAlert) -> tuple:
+        return (
+            alert.subscriber_key,
+            alert.parent_port_key,
+            alert.batch_id,
+            alert.ma_tb,
+            alert.ten_tb,
+            alert.olt_name,
+            alert.doi_vt,
+            alert.diachi_ld,
+            alert.dienthoai_lh,
+            alert.ten_nvkt_db,
+            _iso(alert.outage_time),
+            _iso(alert.recovery_time),
+            alert.outage_duration_minutes,
+            int(alert.notification_sent),
+            _iso(alert.notification_time),
+        )
+
+    def insert_recovery_alerts_bulk(self, alerts: Sequence[RecoveryAlert]):
+        if not alerts:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                self._insert_recovery_alert_sql(),
+                [self._recovery_alert_params(alert) for alert in alerts],
+            )
+            conn.commit()
+
+    def persist_state_machine_results(
+        self,
+        states: Sequence[Dict],
+        outage_alerts: Sequence[OutageAlert],
+        recovery_alerts: Sequence[RecoveryAlert],
+    ):
+        if not states and not outage_alerts and not recovery_alerts:
+            return
+        with self.connect() as conn:
+            if states:
+                conn.executemany(
+                    self._save_state_sql(),
+                    [self._state_params(state) for state in states],
+                )
+            if outage_alerts:
+                conn.executemany(
+                    self._insert_outage_alert_sql(),
+                    [self._outage_alert_params(alert) for alert in outage_alerts],
+                )
+            if recovery_alerts:
+                conn.executemany(
+                    self._insert_recovery_alert_sql(),
+                    [self._recovery_alert_params(alert) for alert in recovery_alerts],
+                )
+            conn.commit()
+
     def insert_wide_area_alert(self, alert: WideAreaAlert) -> Optional[int]:
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO wide_area_alerts (
-                    batch_id, parent_port_key, olt_name, port, subscriber_count,
+                    batch_id, parent_port_key, olt_name, port, subscriber_count, incident_type,
                     subscriber_keys_json, subscriber_summary_json, doi_vt,
-                    alert_time, notification_sent, notification_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    alert_time, first_off_time, off_duration_minutes,
+                    notification_sent, notification_time
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     alert.batch_id,
@@ -487,10 +609,13 @@ class AlertRepository:
                     alert.olt_name,
                     alert.port,
                     alert.subscriber_count,
+                    alert.incident_type,
                     json.dumps(alert.subscriber_keys, ensure_ascii=False),
                     json.dumps(alert.subscriber_list, ensure_ascii=False),
                     alert.doi_vt,
                     _iso(alert.alert_time),
+                    _iso(alert.first_off_time),
+                    alert.off_duration_minutes,
                     int(alert.notification_sent),
                     _iso(alert.notification_time),
                 ),
@@ -612,6 +737,80 @@ class AlertRepository:
             )
             conn.commit()
 
+    def get_runtime_state(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM notification_runtime_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+            return row["value"] if row else default
+
+    def set_runtime_state(self, key: str, value: Optional[str]):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO notification_runtime_state(key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, value),
+            )
+            conn.commit()
+
+    def advance_notification_cycle(self, cycle_name: str, batch_id: str) -> int:
+        counter_key = f"{cycle_name}_counter"
+        last_batch_key = f"{cycle_name}_last_batch_id"
+
+        with self.connect() as conn:
+            last_batch_row = conn.execute(
+                "SELECT value FROM notification_runtime_state WHERE key = ?",
+                (last_batch_key,),
+            ).fetchone()
+            if last_batch_row and last_batch_row["value"] == batch_id:
+                counter_row = conn.execute(
+                    "SELECT value FROM notification_runtime_state WHERE key = ?",
+                    (counter_key,),
+                ).fetchone()
+                try:
+                    return int(counter_row["value"]) if counter_row and counter_row["value"] is not None else 0
+                except (TypeError, ValueError):
+                    return 0
+
+            counter_row = conn.execute(
+                "SELECT value FROM notification_runtime_state WHERE key = ?",
+                (counter_key,),
+            ).fetchone()
+            try:
+                counter_value = int(counter_row["value"]) if counter_row and counter_row["value"] is not None else 0
+            except (TypeError, ValueError):
+                counter_value = 0
+
+            counter_value += 1
+            conn.execute(
+                """
+                INSERT INTO notification_runtime_state(key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (counter_key, str(counter_value)),
+            )
+            conn.execute(
+                """
+                INSERT INTO notification_runtime_state(key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (last_batch_key, batch_id),
+            )
+            conn.commit()
+            return counter_value
+
     def upsert_pattern_exclusion(
         self,
         ma_tb: str,
@@ -703,10 +902,13 @@ class AlertRepository:
             olt_name=row["olt_name"],
             port=row["port"],
             subscriber_count=row["subscriber_count"],
+            incident_type=(row["incident_type"] or "wide_area"),
             subscriber_keys=json.loads(row["subscriber_keys_json"] or "[]"),
             subscriber_list=json.loads(row["subscriber_summary_json"] or "[]"),
             doi_vt=row["doi_vt"] or "",
             alert_time=_dt(row["alert_time"]),
+            first_off_time=_dt(row["first_off_time"]),
+            off_duration_minutes=row["off_duration_minutes"] or 0,
             notification_sent=bool(row["notification_sent"]),
             notification_time=_dt(row["notification_time"]),
         )

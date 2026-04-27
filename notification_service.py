@@ -40,6 +40,17 @@ def _env_str(name: str, default: str = "") -> str:
     return str(os.environ.get(name, default) or "").strip()
 
 
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 def _build_default_config() -> Dict:
     return {
         "telegram_bot_token": _env_str("TELEGRAM_BOT_TOKEN", ""),
@@ -53,6 +64,8 @@ def _build_default_config() -> Dict:
         "wide_area_alert_time_window": _env_str("WIDE_AREA_ALERT_TIME_WINDOW", ""),
         "recovery_alert_time_window": _env_str("RECOVERY_ALERT_TIME_WINDOW", ""),
         "wide_area_alert_excluded_ports": _env_str("WIDE_AREA_ALERT_EXCLUDED_PORTS", ""),
+        "current_off_alert_start_time": _env_str("CURRENT_OFF_ALERT_START_TIME", "06:00"),
+        "individual_alert_send_every_batches": _env_int("INDIVIDUAL_ALERT_SEND_EVERY_BATCHES", 1),
     }
 
 
@@ -140,6 +153,15 @@ def get_alert_policy_status(alert_type: str, config: Optional[Dict] = None, now:
         "reason": "allowed",
         "message": f"{policy['label']} notifications allowed",
     }
+
+
+def get_individual_alert_send_every_batches(config: Optional[Dict] = None) -> int:
+    active_config = config or load_config()
+    try:
+        value = int(active_config.get("individual_alert_send_every_batches", 1))
+    except (TypeError, ValueError):
+        return 1
+    return value if value > 0 else 1
 
 
 def _normalize_excluded_port_value(value: str) -> str:
@@ -274,6 +296,39 @@ def _coerce_datetime(value) -> Optional[datetime]:
         except ValueError:
             return None
     return None
+
+
+def get_current_off_alert_cutoff(config: Optional[Dict] = None, now: Optional[datetime] = None) -> Optional[datetime]:
+    active_config = config or load_config()
+    start_time_raw = str(active_config.get("current_off_alert_start_time", "") or "").strip()
+    if not start_time_raw:
+        return None
+
+    try:
+        start_time = _parse_hhmm(start_time_raw)
+    except ValueError:
+        print(f"⚠️ Invalid CURRENT_OFF_ALERT_START_TIME '{start_time_raw}', allowing all current-off alerts.")
+        return None
+
+    current_day = (now or datetime.now()).date()
+    return datetime.combine(current_day, start_time)
+
+
+def filter_current_off_alerts_by_cutoff(
+    alerts: List,
+    config: Optional[Dict] = None,
+    now: Optional[datetime] = None,
+) -> List:
+    cutoff = get_current_off_alert_cutoff(config=config, now=now)
+    if cutoff is None:
+        return list(alerts)
+
+    filtered = []
+    for alert in alerts:
+        first_off_time = _coerce_datetime(_value(alert, "first_off_time"))
+        if first_off_time and first_off_time >= cutoff:
+            filtered.append(alert)
+    return filtered
 
 
 def _resolve_outage_duration_minutes(obj) -> Optional[int]:
@@ -483,8 +538,13 @@ def format_wide_area_outage_message(wide_area_alerts: List[Dict]) -> str:
     if not wide_area_alerts:
         return ""
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
+    is_port_down_message = all(
+        str(alert.get("incident_type", "wide_area")).lower() == "port_down"
+        for alert in wide_area_alerts
+    )
+    title = "CẢNH BÁO PORT OLT DOWN" if is_port_down_message else "CẢNH BÁO SỰ CỐ DIỆN RỘNG"
     lines = [
-        f"🔴 *CẢNH BÁO SỰ CỐ DIỆN RỘNG* - {now}",
+        f"🔴 *{title}* - {now}",
         "",
         f"Phát hiện *{len(wide_area_alerts)}* port có nhiều thuê bao mất tín hiệu:",
         "",
@@ -492,6 +552,7 @@ def format_wide_area_outage_message(wide_area_alerts: List[Dict]) -> str:
     for idx, alert in enumerate(wide_area_alerts, 1):
         lines.append(f"*{idx}. Port {alert['port']}* - {alert['subscriber_count']} thuê bao OFF")
         lines.append(f"   🏢 OLT: {get_olt_display_name(alert['olt_name'])}")
+        lines.append(f"   🕒 Bắt đầu: {_format_off_time(alert)}")
         lines.append(f"   ⏱️ Kéo dài: {_format_outage_duration(alert)}")
         lines.append("   📋 Danh sách thuê bao:")
         for sub_idx, sub in enumerate(alert.get("subscriber_list", []), 1):
@@ -504,11 +565,17 @@ def format_wide_area_outage_message(wide_area_alerts: List[Dict]) -> str:
 
 
 def format_wide_area_outage_for_zalo(wide_area_alert: Dict) -> str:
+    title = (
+        "CẢNH BÁO PORT OLT DOWN"
+        if str(wide_area_alert.get("incident_type", "wide_area")).lower() == "port_down"
+        else "CẢNH BÁO SỰ CỐ DIỆN RỘNG"
+    )
     lines = [
-        "🔴 CẢNH BÁO SỰ CỐ DIỆN RỘNG",
+        f"🔴 {title}",
         f"  - OLT: {get_olt_display_name(wide_area_alert['olt_name'])}",
         f"  - Port: {wide_area_alert['port']}",
         f"  - Số thuê bao OFF: {wide_area_alert['subscriber_count']}",
+        f"  - Bắt đầu: {_format_off_time(wide_area_alert)}",
         f"  - Kéo dài: {_format_outage_duration(wide_area_alert)}",
         "  - Danh sách thuê bao:",
     ]

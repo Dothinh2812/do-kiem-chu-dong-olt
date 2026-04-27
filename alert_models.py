@@ -96,10 +96,13 @@ class WideAreaAlert:
     olt_name: str
     port: str
     subscriber_count: int
+    incident_type: str = "wide_area"
     subscriber_keys: List[str] = field(default_factory=list)
     subscriber_list: List[dict] = field(default_factory=list)
     doi_vt: str = ""
     alert_time: Optional[datetime] = None
+    first_off_time: Optional[datetime] = None
+    off_duration_minutes: int = 0
     notification_sent: bool = False
     notification_time: Optional[datetime] = None
     id: Optional[int] = None

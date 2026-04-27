@@ -21,11 +21,20 @@ def load_current_off_snapshot_rows(repo: AlertRepository, batch_id: str) -> List
     return load_snapshot_rows_for_batch(snapshot_path, batch_id)
 
 
+def filter_active_current_off_snapshot_rows(rows: List[Dict]) -> List[Dict]:
+    return [
+        row
+        for row in rows
+        if not row.get("suppressed_by_pattern") and not row.get("suppressed_by_wide_area")
+    ]
+
+
 async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     results = {
         "wide_area": {
             "pending_alerts": 0,
             "excluded_by_config": 0,
+            "port_down_below_threshold": 0,
             "marked_sent_alerts": 0,
             "telegram_sent": False,
             "zalo_messages_sent": 0,
@@ -59,10 +68,22 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     excluded_wide_area_alerts = [
         alert for alert in wide_area_alerts if notification_service.is_wide_area_alert_excluded(alert, config)
     ]
+    min_port_down_subscribers = 5
+    skipped_small_port_down_alerts = [
+        alert
+        for alert in wide_area_alerts
+        if alert not in excluded_wide_area_alerts
+        if str(getattr(alert, "incident_type", "wide_area")).lower() == "port_down"
+        and int(getattr(alert, "subscriber_count", 0) or 0) < min_port_down_subscribers
+    ]
     eligible_wide_area_alerts = [
-        alert for alert in wide_area_alerts if not notification_service.is_wide_area_alert_excluded(alert, config)
+        alert
+        for alert in wide_area_alerts
+        if not notification_service.is_wide_area_alert_excluded(alert, config)
+        and alert not in skipped_small_port_down_alerts
     ]
     results["wide_area"]["excluded_by_config"] = len(excluded_wide_area_alerts)
+    results["wide_area"]["port_down_below_threshold"] = len(skipped_small_port_down_alerts)
     if excluded_wide_area_alerts:
         excluded_ports = ", ".join(
             f"{notification_service.get_olt_display_name(alert.olt_name)}:{alert.port}"
@@ -71,6 +92,15 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
         _emit(
             log,
             f"[NOTIFY] Batch {batch_id}: wide-area excluded_by_config={len(excluded_wide_area_alerts)} ports={excluded_ports}",
+        )
+    if skipped_small_port_down_alerts:
+        skipped_ports = ", ".join(
+            f"{notification_service.get_olt_display_name(alert.olt_name)}:{alert.port}({alert.subscriber_count})"
+            for alert in skipped_small_port_down_alerts
+        )
+        _emit(
+            log,
+            f"[NOTIFY] Batch {batch_id}: wide-area port_down_below_threshold={len(skipped_small_port_down_alerts)} ports={skipped_ports}",
         )
 
     wide_area_policy = notification_service.get_alert_policy_status("wide_area", config)
@@ -172,13 +202,40 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     if excluded_wide_area_alerts:
         repo.mark_wide_area_alerts_sent(alert.id for alert in excluded_wide_area_alerts if alert.id)
         results["wide_area"]["marked_sent_alerts"] += len(excluded_wide_area_alerts)
+    if skipped_small_port_down_alerts:
+        repo.mark_wide_area_alerts_sent(alert.id for alert in skipped_small_port_down_alerts if alert.id)
+        results["wide_area"]["marked_sent_alerts"] += len(skipped_small_port_down_alerts)
 
     raw_outage_alerts = load_current_off_snapshot_rows(repo, batch_id)
+    active_outage_alerts = filter_active_current_off_snapshot_rows(raw_outage_alerts)
     outage_policy = notification_service.get_alert_policy_status("outage", config)
-    outage_alerts = raw_outage_alerts if outage_policy["allowed"] else []
+    outage_cycle = repo.advance_notification_cycle("individual_alert", batch_id)
+    outage_interval = notification_service.get_individual_alert_send_every_batches(config)
+    cycle_allows_send = outage_cycle % outage_interval == 0
+    cutoff_filtered_outage_alerts = (
+        notification_service.filter_current_off_alerts_by_cutoff(active_outage_alerts, config=config)
+        if outage_policy["allowed"]
+        else []
+    )
+    outage_alerts = cutoff_filtered_outage_alerts if outage_policy["allowed"] and cycle_allows_send else []
     results["outage"]["raw_pending_alerts"] = len(raw_outage_alerts)
     results["outage"]["filtered_pending_alerts"] = len(outage_alerts)
     results["outage"]["filtered_out_alerts"] = len(raw_outage_alerts) - len(outage_alerts)
+    cutoff = notification_service.get_current_off_alert_cutoff(config)
+    if outage_policy["allowed"] and cutoff is not None:
+        _emit(
+            log,
+            "[NOTIFY] Batch "
+            f"{batch_id}: individual outage cutoff={cutoff} "
+            f"filtered_by_cutoff={len(active_outage_alerts) - len(outage_alerts)}",
+        )
+    if outage_policy["allowed"] and raw_outage_alerts:
+        _emit(
+            log,
+            "[NOTIFY] Batch "
+            f"{batch_id}: individual outage cycle={outage_cycle} "
+            f"interval={outage_interval} cycle_allows_send={cycle_allows_send}",
+        )
     _emit(
         log,
         "[NOTIFY] Batch "
@@ -187,6 +244,13 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     )
     if raw_outage_alerts and not outage_policy["allowed"]:
         _emit(log, f"[NOTIFY] Batch {batch_id}: {outage_policy['message']}")
+    if cutoff_filtered_outage_alerts and outage_policy["allowed"] and not cycle_allows_send:
+        _emit(
+            log,
+            "[NOTIFY] Batch "
+            f"{batch_id}: individual outage notifications waiting for cycle "
+            f"{outage_interval} (current_cycle={outage_cycle})",
+        )
     if outage_alerts:
         telegram_ok = True
         zalo_results = {"sent": 0}
