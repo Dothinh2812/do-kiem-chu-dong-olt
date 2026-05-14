@@ -587,13 +587,14 @@ def test_format_current_off_snapshot_for_doi_sorts_newest_first_and_numbers_sequ
     assert message.count("--------") == 3
 
 
-def test_format_current_off_snapshot_by_nvkt_uses_first_off_time_string():
+def test_format_current_off_snapshot_by_nvkt_omits_nvkt_header_and_includes_short_address():
     message = notification_service.format_current_off_snapshot_by_nvkt(
         [
             {
                 "ma_tb": "TB001",
                 "ten_tb": "Ten TB",
                 "dienthoai_lh": "0912345678",
+                "diachi_ld": "123 Duong Rat Dai, Phuong Trung Tam, Thi Xa Son Tay",
                 "ten_nvkt_db": "VNPT - Nguyen Van A",
                 "first_off_time": "2026-04-24T08:10:00",
                 "duration_minutes": 35,
@@ -601,7 +602,8 @@ def test_format_current_off_snapshot_by_nvkt_uses_first_off_time_string():
         ]
     )
 
-    assert "TB001 | Ten TB | 0912345678 | 08:10 | 35 phút" in message
+    assert "👷 Nguyen Van A (1 TB)" not in message
+    assert "TB001 | Ten TB | 0912345678 | 08:10 | 35 phút | 123 Duong Rat Dai, Phuong Tru" in message
 
 
 def test_send_current_off_snapshot_by_doi_vt_splits_messages_by_nvkt(monkeypatch):

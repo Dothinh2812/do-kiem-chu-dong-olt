@@ -372,8 +372,9 @@ def _truncate_address(value: str, limit: int = 40) -> str:
     return (value or "").strip()[:limit] or "-"
 
 
-def _resolve_address(obj) -> str:
-    return _truncate_address(_value(obj, "diachi_lapdat", "") or _value(obj, "diachi_ld", "") or "")
+def _resolve_address(obj, limit: int = 40) -> str:
+    raw_address = _value(obj, "diachi_lapdat", "") or _value(obj, "diachi_ld", "") or ""
+    return _truncate_address(raw_address, limit=limit)
 
 
 def _format_off_time(obj) -> str:
@@ -588,26 +589,21 @@ def format_wide_area_outage_for_zalo(wide_area_alert: Dict) -> str:
 
 
 def format_consolidated_outage_by_nvkt(alerts: List, for_zalo: bool = False) -> str:
-    groups = defaultdict(list)
-    for alert in alerts:
-        nvkt = _short_nvkt(_value(alert, "ten_nvkt_db", "") or "")
-        groups[nvkt or "Chưa gán NVKT"].append(alert)
-
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines = [
         f"🚨 {'THUÊ BAO OFF' if for_zalo else '*THUÊ BAO OFF*'} - {now}",
         "",
     ]
-    for nvkt, items in groups.items():
-        lines.append(f"👷 {nvkt} ({len(items)} TB)")
-        for alert in items:
-            ma_tb = _value(alert, "ma_tb", "") or ""
-            ten_tb = _value(alert, "ten_tb", "") or ""
-            sdt = _value(alert, "dienthoai_lh", "") or "-"
-            off_time = _coerce_datetime(_value(alert, "first_off_time"))
-            off_time_str = off_time.strftime("%H:%M") if off_time else str(_value(alert, "first_off_time") or "-")
-            lines.append(f"  {ma_tb} | {ten_tb} | {sdt} | {off_time_str} | {_format_outage_duration(alert)}")
-        lines.append("")
+    for alert in alerts:
+        ma_tb = _value(alert, "ma_tb", "") or ""
+        ten_tb = _value(alert, "ten_tb", "") or ""
+        sdt = _value(alert, "dienthoai_lh", "") or "-"
+        address = _resolve_address(alert, limit=30)
+        off_time = _coerce_datetime(_value(alert, "first_off_time"))
+        off_time_str = off_time.strftime("%H:%M") if off_time else str(_value(alert, "first_off_time") or "-")
+        lines.append(
+            f"{ma_tb} | {ten_tb} | {sdt} | {off_time_str} | {_format_outage_duration(alert)} | {address}"
+        )
     return "\n".join(lines)
 
 
