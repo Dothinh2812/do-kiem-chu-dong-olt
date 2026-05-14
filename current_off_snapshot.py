@@ -35,11 +35,19 @@ def build_snapshot_row(
     suppressed_by_pattern: bool = False,
     suppressed_by_wide_area: bool = False,
     suppression_reason: str = "",
+    override_first_off_time=None,
+    override_duration_minutes: Optional[int] = None,
 ) -> Dict:
     state = state or {}
-    first_off_time = _coerce_datetime(state.get("first_off_time")) or _coerce_datetime(getattr(snapshot, "measured_at", None))
+    first_off_time = (
+        _coerce_datetime(override_first_off_time)
+        or _coerce_datetime(state.get("first_off_time"))
+        or _coerce_datetime(getattr(snapshot, "measured_at", None))
+    )
     measured_at = _coerce_datetime(getattr(snapshot, "measured_at", None))
-    if first_off_time and measured_at:
+    if override_duration_minutes is not None:
+        duration_minutes = max(int(override_duration_minutes or 0), 0)
+    elif first_off_time and measured_at:
         duration_minutes = max(int((measured_at - first_off_time).total_seconds() // 60), 0)
     else:
         duration_minutes = 0
@@ -76,14 +84,17 @@ def build_current_off_snapshot(
     *,
     exclusion_list: Optional[Iterable[str]] = None,
     wide_area_subscriber_keys: Optional[Iterable[str]] = None,
+    wide_area_timing_by_subscriber: Optional[Dict[str, Dict]] = None,
 ) -> List[Dict]:
     exclusion_set = {ma_tb for ma_tb in (exclusion_list or []) if ma_tb}
     wide_area_set = set(wide_area_subscriber_keys or [])
+    wide_area_timing_by_subscriber = wide_area_timing_by_subscriber or {}
     rows: List[Dict] = []
     for snapshot in current_offs:
         ma_tb = getattr(snapshot, "ma_tb", "") or ""
         suppressed_by_pattern = ma_tb in exclusion_set
         suppressed_by_wide_area = snapshot.subscriber_key in wide_area_set
+        wide_area_timing = wide_area_timing_by_subscriber.get(snapshot.subscriber_key, {})
         reasons = []
         if suppressed_by_pattern:
             reasons.append("pattern_exclusion")
@@ -96,6 +107,8 @@ def build_current_off_snapshot(
                 suppressed_by_pattern=suppressed_by_pattern,
                 suppressed_by_wide_area=suppressed_by_wide_area,
                 suppression_reason=",".join(reasons),
+                override_first_off_time=wide_area_timing.get("first_off_time") if suppressed_by_wide_area else None,
+                override_duration_minutes=wide_area_timing.get("duration_minutes") if suppressed_by_wide_area else None,
             )
         )
     rows.sort(key=lambda row: (row["doi_vt"], row["ten_nvkt_db"], row["subscriber_key"]))
@@ -107,6 +120,7 @@ def build_snapshot_payload(
     measured_at,
     subscribers: List[Dict],
     *,
+    stale_assignment_suppressed: int = 0,
     generated_at: Optional[datetime] = None,
 ) -> Dict:
     measured_at_dt = _coerce_datetime(measured_at)
@@ -134,6 +148,7 @@ def build_snapshot_payload(
                 for row in subscribers
                 if row.get("suppressed_by_pattern") or row.get("suppressed_by_wide_area")
             ),
+            "stale_assignment_suppressed": max(int(stale_assignment_suppressed or 0), 0),
             "group_count_by_doi_vt": group_count_by_doi_vt,
         },
         "subscribers": subscribers,

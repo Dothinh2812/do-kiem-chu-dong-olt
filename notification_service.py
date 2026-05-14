@@ -22,6 +22,7 @@ except ImportError:
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config_notification.json")
 OLT_MAPPING_FILE = os.path.join(os.path.dirname(__file__), "olt_mapping.xlsx")
+DEFAULT_INDIVIDUAL_ZALO_MAPPING_FILE = os.path.join(os.path.dirname(__file__), "individual_zalo_mapping.json")
 DEFAULT_OPENZCA_PROFILE = os.environ.get("OPENZCA_PROFILE", "zalo2")
 NOTIFICATION_DELIVERY_LOG_FILE = os.path.join("log_message", "notification_delivery.jsonl")
 _OLT_DISPLAY_NAME_CACHE = None
@@ -57,19 +58,42 @@ def _build_default_config() -> Dict:
         "telegram_chat_id": _env_str("TELEGRAM_CHAT_ID", ""),
         "enable_telegram": _env_bool("ENABLE_TELEGRAM", True),
         "enable_zalo": _env_bool("ENABLE_ZALO", True),
-        "enable_individual_alert_notifications": _env_bool("ENABLE_INDIVIDUAL_ALERT_NOTIFICATIONS", True),
+        "enable_group_alert_notifications": _env_bool("ENABLE_GROUP_ALERT_NOTIFICATIONS", True),
+        "enable_individual_alert_notifications": _env_bool("ENABLE_INDIVIDUAL_ALERT_NOTIFICATIONS", False),
         "enable_wide_area_alert_notifications": _env_bool("ENABLE_WIDE_AREA_ALERT_NOTIFICATIONS", True),
         "enable_recovery_alert_notifications": _env_bool("ENABLE_RECOVERY_ALERT_NOTIFICATIONS", False),
+        "group_alert_time_window": _env_str("GROUP_ALERT_TIME_WINDOW", ""),
         "individual_alert_time_window": _env_str("INDIVIDUAL_ALERT_TIME_WINDOW", ""),
         "wide_area_alert_time_window": _env_str("WIDE_AREA_ALERT_TIME_WINDOW", ""),
         "recovery_alert_time_window": _env_str("RECOVERY_ALERT_TIME_WINDOW", ""),
         "wide_area_alert_excluded_ports": _env_str("WIDE_AREA_ALERT_EXCLUDED_PORTS", ""),
         "current_off_alert_start_time": _env_str("CURRENT_OFF_ALERT_START_TIME", "06:00"),
+        "group_alert_start_time": _env_str(
+            "GROUP_ALERT_START_TIME",
+            _env_str("CURRENT_OFF_ALERT_START_TIME", "06:00"),
+        ),
+        "individual_alert_start_time": _env_str(
+            "INDIVIDUAL_ALERT_START_TIME",
+            _env_str("CURRENT_OFF_ALERT_START_TIME", "06:00"),
+        ),
+        "group_alert_send_every_batches": _env_int(
+            "GROUP_ALERT_SEND_EVERY_BATCHES",
+            _env_int("INDIVIDUAL_ALERT_SEND_EVERY_BATCHES", 1),
+        ),
         "individual_alert_send_every_batches": _env_int("INDIVIDUAL_ALERT_SEND_EVERY_BATCHES", 1),
+        "individual_zalo_mapping_file": _env_str(
+            "INDIVIDUAL_ZALO_MAPPING_FILE",
+            DEFAULT_INDIVIDUAL_ZALO_MAPPING_FILE,
+        ),
     }
 
 
 _ALERT_POLICY_CONFIG = {
+    "group_outage": {
+        "enabled_key": "enable_group_alert_notifications",
+        "window_key": "group_alert_time_window",
+        "label": "group outage",
+    },
     "outage": {
         "enabled_key": "enable_individual_alert_notifications",
         "window_key": "individual_alert_time_window",
@@ -164,6 +188,20 @@ def get_individual_alert_send_every_batches(config: Optional[Dict] = None) -> in
     return value if value > 0 else 1
 
 
+def get_group_alert_send_every_batches(config: Optional[Dict] = None) -> int:
+    active_config = config or load_config()
+    try:
+        value = int(
+            active_config.get(
+                "group_alert_send_every_batches",
+                active_config.get("individual_alert_send_every_batches", 1),
+            )
+        )
+    except (TypeError, ValueError):
+        return 1
+    return value if value > 0 else 1
+
+
 def _normalize_excluded_port_value(value: str) -> str:
     return str(value or "").strip().upper()
 
@@ -211,6 +249,51 @@ def is_wide_area_alert_excluded(alert, config: Optional[Dict] = None) -> bool:
 
 def get_zalo_thread_by_doi_vt(doi_vt: str) -> Optional[str]:
     return get_thread_id_for_doi_vt(doi_vt)
+
+
+def _normalize_nvkt_name(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def load_individual_zalo_mapping(config: Optional[Dict] = None) -> Dict[str, str]:
+    active_config = config or load_config()
+    mapping_file = str(
+        active_config.get("individual_zalo_mapping_file")
+        or os.environ.get("INDIVIDUAL_ZALO_MAPPING_FILE")
+        or DEFAULT_INDIVIDUAL_ZALO_MAPPING_FILE
+    ).strip()
+    if not mapping_file or not os.path.exists(mapping_file):
+        return {}
+
+    try:
+        with open(mapping_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        print(f"⚠️ Could not load individual Zalo mapping from {mapping_file}: {exc}")
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    mapping = {}
+    for raw_name, raw_user_id in payload.items():
+        name = str(raw_name or "").strip()
+        user_id = str(raw_user_id or "").strip()
+        if not name or not user_id:
+            continue
+        mapping[_normalize_nvkt_name(name)] = user_id
+        short_name = _short_nvkt(name)
+        if short_name:
+            mapping[_normalize_nvkt_name(short_name)] = user_id
+    return mapping
+
+
+def get_zalo_user_by_nvkt(nvkt_name: str, config: Optional[Dict] = None) -> Optional[str]:
+    normalized_name = _normalize_nvkt_name(nvkt_name)
+    if not normalized_name:
+        return None
+    mapping = load_individual_zalo_mapping(config=config)
+    return mapping.get(normalized_name) or mapping.get(_normalize_nvkt_name(_short_nvkt(nvkt_name)))
 
 
 def _normalize_mapping_header(value: str) -> str:
@@ -298,16 +381,23 @@ def _coerce_datetime(value) -> Optional[datetime]:
     return None
 
 
-def get_current_off_alert_cutoff(config: Optional[Dict] = None, now: Optional[datetime] = None) -> Optional[datetime]:
+def get_current_off_alert_cutoff(
+    config: Optional[Dict] = None,
+    now: Optional[datetime] = None,
+    start_time_key: str = "current_off_alert_start_time",
+) -> Optional[datetime]:
     active_config = config or load_config()
-    start_time_raw = str(active_config.get("current_off_alert_start_time", "") or "").strip()
+    if start_time_key in active_config:
+        start_time_raw = str(active_config.get(start_time_key, "") or "").strip()
+    else:
+        start_time_raw = str(active_config.get("current_off_alert_start_time", "") or "").strip()
     if not start_time_raw:
         return None
 
     try:
         start_time = _parse_hhmm(start_time_raw)
     except ValueError:
-        print(f"⚠️ Invalid CURRENT_OFF_ALERT_START_TIME '{start_time_raw}', allowing all current-off alerts.")
+        print(f"⚠️ Invalid alert start time '{start_time_raw}' for {start_time_key}, allowing all current-off alerts.")
         return None
 
     current_day = (now or datetime.now()).date()
@@ -318,8 +408,9 @@ def filter_current_off_alerts_by_cutoff(
     alerts: List,
     config: Optional[Dict] = None,
     now: Optional[datetime] = None,
+    start_time_key: str = "current_off_alert_start_time",
 ) -> List:
-    cutoff = get_current_off_alert_cutoff(config=config, now=now)
+    cutoff = get_current_off_alert_cutoff(config=config, now=now, start_time_key=start_time_key)
     if cutoff is None:
         return list(alerts)
 
@@ -473,6 +564,23 @@ async def send_zalo_message_to_thread_detailed(
     thread_id: str,
     client: Optional[OpenZcaClient] = None,
 ) -> Dict:
+    return await _send_zalo_message_detailed(message, thread_id, group=True, client=client)
+
+
+async def send_zalo_message_to_user_detailed(
+    message: str,
+    user_id: str,
+    client: Optional[OpenZcaClient] = None,
+) -> Dict:
+    return await _send_zalo_message_detailed(message, user_id, group=False, client=client)
+
+
+async def _send_zalo_message_detailed(
+    message: str,
+    thread_id: str,
+    group: bool,
+    client: Optional[OpenZcaClient] = None,
+) -> Dict:
     if not thread_id:
         return {
             "success": False,
@@ -483,7 +591,7 @@ async def send_zalo_message_to_thread_detailed(
     try:
         active_client = client or get_openzca_client()
         if hasattr(active_client, "send_text_detailed"):
-            result = active_client.send_text_detailed(thread_id, message, group=True)
+            result = active_client.send_text_detailed(thread_id, message, group=group)
             if isinstance(result, dict):
                 return {
                     "success": bool(result.get("success")),
@@ -509,7 +617,7 @@ async def send_zalo_message_to_thread_detailed(
                 "returncode": result.returncode,
                 "command": result.command,
             }
-        response = active_client.send_text(thread_id, message, group=True)
+        response = active_client.send_text(thread_id, message, group=group)
     except Exception as exc:
         print(f"❌ Zalo send error via openzca: {exc}")
         return {

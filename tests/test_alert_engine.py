@@ -355,6 +355,218 @@ def test_wide_area_alert_persists_start_time_and_duration(db_paths):
     assert wide_area["off_duration_minutes"] == 10
 
 
+def test_wide_area_alert_starts_new_incident_after_port_recovers_below_threshold(db_paths):
+    measurement_db, source_db = db_paths
+    subscribers = [f"HNI.PTO.VXN.OLT.ZT.1.1_1-1-6:{i}" for i in range(1, 7)]
+
+    for idx, subscriber_key in enumerate(subscribers, start=1):
+        insert_danhba_row(source_db, subscriber_key, f"VXN{idx:03d}")
+
+    first_incident_time = datetime(2026, 4, 24, 15, 20, 0)
+    for subscriber_key in subscribers:
+        insert_measurement_row(
+            measurement_db,
+            subscriber_key,
+            "b1",
+            "OFF",
+            first_incident_time,
+            onu_last_off="2026-04-24 15:20:00",
+        )
+    run_batch(measurement_db, source_db, "b1", first_incident_time, send_notifications=False)
+
+    recovered_time = datetime(2026, 4, 28, 12, 0, 0)
+    insert_measurement_row(
+        measurement_db,
+        subscribers[0],
+        "b2",
+        "OFF",
+        recovered_time,
+        onu_last_off="",
+    )
+    for subscriber_key in subscribers[1:]:
+        insert_measurement_row(measurement_db, subscriber_key, "b2", "ON", recovered_time)
+    run_batch(measurement_db, source_db, "b2", recovered_time, send_notifications=False)
+
+    second_incident_time = datetime(2026, 4, 28, 12, 25, 0)
+    insert_measurement_row(
+        measurement_db,
+        subscribers[0],
+        "b3",
+        "OFF",
+        second_incident_time,
+        onu_last_off="",
+    )
+    for subscriber_key in subscribers[1:]:
+        insert_measurement_row(
+            measurement_db,
+            subscriber_key,
+            "b3",
+            "OFF",
+            second_incident_time,
+            onu_last_off="2026-04-28 12:25:00",
+        )
+
+    result = run_batch(measurement_db, source_db, "b3", second_incident_time, send_notifications=False)
+
+    wide_area = fetch_one(
+        measurement_db,
+        "SELECT first_off_time, off_duration_minutes, subscriber_count FROM wide_area_alerts WHERE batch_id = ?",
+        ("b3",),
+    )
+    assert result["wide_area_alerts_created"] == 1
+    assert wide_area["subscriber_count"] == 6
+    assert wide_area["first_off_time"] == "2026-04-28T12:25:00"
+    assert wide_area["off_duration_minutes"] == 0
+
+
+def test_current_off_snapshot_uses_wide_area_timing_for_suppressed_rows(db_paths):
+    measurement_db, source_db = db_paths
+    subscribers = [f"HNI.PTO.VXN.OLT.ZT.1.1_1-1-6:{i}" for i in range(1, 7)]
+
+    for idx, subscriber_key in enumerate(subscribers, start=1):
+        insert_danhba_row(source_db, subscriber_key, f"VXN{idx:03d}")
+
+    first_incident_time = datetime(2026, 4, 24, 15, 20, 0)
+    for subscriber_key in subscribers:
+        insert_measurement_row(
+            measurement_db,
+            subscriber_key,
+            "b1",
+            "OFF",
+            first_incident_time,
+            onu_last_off="2026-04-24 15:20:00",
+        )
+    run_batch(measurement_db, source_db, "b1", first_incident_time, send_notifications=False)
+
+    recovered_time = datetime(2026, 4, 28, 12, 0, 0)
+    insert_measurement_row(measurement_db, subscribers[0], "b2", "OFF", recovered_time)
+    for subscriber_key in subscribers[1:]:
+        insert_measurement_row(measurement_db, subscriber_key, "b2", "ON", recovered_time)
+    run_batch(measurement_db, source_db, "b2", recovered_time, send_notifications=False)
+
+    second_incident_time = datetime(2026, 4, 28, 12, 25, 0)
+    insert_measurement_row(measurement_db, subscribers[0], "b3", "OFF", second_incident_time)
+    for subscriber_key in subscribers[1:]:
+        insert_measurement_row(
+            measurement_db,
+            subscriber_key,
+            "b3",
+            "OFF",
+            second_incident_time,
+            onu_last_off="2026-04-28 12:25:00",
+        )
+
+    result = run_batch(measurement_db, source_db, "b3", second_incident_time, send_notifications=False)
+    payload = json.loads(Path(result["current_off_snapshot_file"]).read_text(encoding="utf-8"))
+    wide_area_rows = [row for row in payload["subscribers"] if row["suppressed_by_wide_area"]]
+
+    assert len(wide_area_rows) == 6
+    assert {row["first_off_time"] for row in wide_area_rows} == {"2026-04-28T12:25:00"}
+    assert {row["duration_minutes"] for row in wide_area_rows} == {0}
+
+
+def test_stale_assignment_off_row_does_not_create_individual_outage(db_paths):
+    measurement_db, source_db = db_paths
+    old_key = "HNI.STY.STY.OLT.AL.2.1_1-1-1:1"
+    current_key = "HNI.STY.STY.OLT.AL.2.1_1-1-2:1"
+    insert_danhba_row(source_db, current_key, "TBMOVED")
+
+    insert_measurement_row(
+        measurement_db,
+        old_key,
+        "b1",
+        "OFF",
+        datetime(2026, 4, 29, 8, 0, 0),
+        account_fiber="TBMOVED",
+        onu_last_off="2026-04-29 08:00:00",
+    )
+    result = run_batch(measurement_db, source_db, "b1", datetime(2026, 4, 29, 8, 0, 5))
+
+    assert result["stale_assignment_suppressed"] == 1
+    assert fetch_one(measurement_db, "SELECT * FROM outage_alerts WHERE subscriber_key = ?", (old_key,)) is None
+    assert fetch_one(
+        measurement_db,
+        "SELECT * FROM subscriber_status_state WHERE subscriber_key = ?",
+        (old_key,),
+    ) is None
+
+
+def test_stale_assignment_rows_do_not_create_wide_area_alert(db_paths):
+    measurement_db, source_db = db_paths
+    old_subscribers = [f"HNI.STY.STY.OLT.AL.2.1_1-1-1:{idx}" for idx in range(1, 7)]
+    current_subscribers = [f"HNI.STY.STY.OLT.AL.2.1_1-1-2:{idx}" for idx in range(1, 7)]
+    for idx, current_key in enumerate(current_subscribers, start=1):
+        insert_danhba_row(source_db, current_key, f"TBMOVED{idx:03d}")
+
+    for idx, old_key in enumerate(old_subscribers, start=1):
+        insert_measurement_row(
+            measurement_db,
+            old_key,
+            "b1",
+            "OFF",
+            datetime(2026, 4, 29, 8, 10, 0),
+            account_fiber=f"TBMOVED{idx:03d}",
+            onu_last_off="2026-04-29 08:05:00",
+        )
+
+    result = run_batch(measurement_db, source_db, "b1", datetime(2026, 4, 29, 8, 10, 5))
+
+    assert result["stale_assignment_suppressed"] == 6
+    assert result["wide_area_alerts_created"] == 0
+    assert fetch_one(measurement_db, "SELECT * FROM wide_area_alerts WHERE batch_id = ?", ("b1",)) is None
+
+
+def test_valid_assignment_off_row_keeps_existing_alert_behavior(db_paths):
+    measurement_db, source_db = db_paths
+    subscriber_key = "HNI.STY.STY.OLT.AL.2.1_1-1-1:1"
+    insert_danhba_row(source_db, subscriber_key, "TBVALID")
+
+    insert_measurement_row(
+        measurement_db,
+        subscriber_key,
+        "b1",
+        "ON",
+        datetime(2026, 4, 29, 7, 50, 0),
+        account_fiber="TBVALID",
+    )
+    first_result = run_batch(measurement_db, source_db, "b1", datetime(2026, 4, 29, 7, 50, 5))
+    insert_measurement_row(
+        measurement_db,
+        subscriber_key,
+        "b2",
+        "ON",
+        datetime(2026, 4, 29, 7, 55, 0),
+        account_fiber="TBVALID",
+    )
+    second_result = run_batch(measurement_db, source_db, "b2", datetime(2026, 4, 29, 7, 55, 5))
+    insert_measurement_row(
+        measurement_db,
+        subscriber_key,
+        "b3",
+        "OFF",
+        datetime(2026, 4, 29, 8, 0, 0),
+        account_fiber="TBVALID",
+        onu_last_off="2026-04-29 08:00:00",
+    )
+    third_result = run_batch(measurement_db, source_db, "b3", datetime(2026, 4, 29, 8, 0, 5))
+    insert_measurement_row(
+        measurement_db,
+        subscriber_key,
+        "b4",
+        "OFF",
+        datetime(2026, 4, 29, 8, 5, 0),
+        account_fiber="TBVALID",
+        onu_last_off="2026-04-29 08:00:00",
+    )
+    fourth_result = run_batch(measurement_db, source_db, "b4", datetime(2026, 4, 29, 8, 5, 5))
+
+    assert first_result["stale_assignment_suppressed"] == 0
+    assert second_result["stale_assignment_suppressed"] == 0
+    assert third_result["stale_assignment_suppressed"] == 0
+    assert fourth_result["stale_assignment_suppressed"] == 0
+    assert fetch_one(measurement_db, "SELECT * FROM outage_alerts WHERE subscriber_key = ?", (subscriber_key,))
+
+
 def test_wide_area_alert_does_not_trigger_for_scattered_onu_last_off_values(db_paths):
     measurement_db, source_db = db_paths
     subscribers = [f"HNI.BVI.TLH.OLT.AL.2.1_1-1-15:{i}" for i in range(1, 7)]

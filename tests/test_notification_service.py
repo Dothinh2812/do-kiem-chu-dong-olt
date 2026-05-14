@@ -133,6 +133,43 @@ def test_send_zalo_message_to_thread_detailed_prefers_client_detailed_result():
     assert result["command"] == ["/node", "/openzca", "--profile", "zalo2", "msg", "send"]
 
 
+def test_send_zalo_message_to_user_detailed_uses_direct_message():
+    class DetailedClient:
+        def __init__(self):
+            self.calls = []
+
+        def send_text_detailed(self, thread_id, message, group=True):
+            self.calls.append({"thread_id": thread_id, "message": message, "group": group})
+            return {
+                "success": True,
+                "thread_id": thread_id,
+                "message": message,
+                "stdout": "ok",
+                "stderr": "",
+                "returncode": 0,
+                "command": ["/node", "/openzca", "msg", "send", thread_id],
+            }
+
+    client = DetailedClient()
+
+    result = asyncio.run(
+        notification_service.send_zalo_message_to_user_detailed(
+            "Noi dung canh bao",
+            "user-123",
+            client=client,
+        )
+    )
+
+    assert result["success"] is True
+    assert client.calls == [
+        {
+            "thread_id": "user-123",
+            "message": "Noi dung canh bao",
+            "group": False,
+        }
+    ]
+
+
 def test_send_zalo_message_to_thread_returns_false_without_thread():
     sent = asyncio.run(notification_service.send_zalo_message_to_thread("Noi dung", ""))
     assert sent is False
@@ -143,6 +180,27 @@ def test_get_zalo_thread_by_doi_vt_supports_short_aliases():
     assert notification_service.get_zalo_thread_by_doi_vt("Quảng Oai") == "7968537750365285360"
     assert notification_service.get_zalo_thread_by_doi_vt("Suối hai") == "6052111621047664"
     assert notification_service.get_zalo_thread_by_doi_vt("Phúc Thọ") == "3142012656522650111"
+
+
+def test_load_individual_zalo_mapping_from_config_file(tmp_path, monkeypatch):
+    mapping_file = tmp_path / "individual_zalo_mapping.json"
+    mapping_file.write_text(
+        json.dumps(
+            {
+                "VNPT - Nguyen Van A": "user-a",
+                "Nguyen Van B": "user-b",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("INDIVIDUAL_ZALO_MAPPING_FILE", str(mapping_file))
+
+    assert notification_service.get_zalo_user_by_nvkt("VNPT - Nguyen Van A") == "user-a"
+    assert notification_service.get_zalo_user_by_nvkt("Nguyen Van B") == "user-b"
+    assert notification_service.get_zalo_user_by_nvkt("VNPT - Nguyen Van B") == "user-b"
+    assert notification_service.get_zalo_user_by_nvkt("Unknown") is None
 
 
 def test_get_alert_policy_status_returns_disabled_when_type_is_turned_off():
@@ -171,6 +229,46 @@ def test_get_alert_policy_status_respects_time_window():
 
     assert policy["allowed"] is False
     assert policy["reason"] == "outside_time_window"
+
+
+def test_get_alert_policy_status_supports_group_outage_policy():
+    policy = notification_service.get_alert_policy_status(
+        "group_outage",
+        {
+            "enable_group_alert_notifications": False,
+            "group_alert_time_window": "06:00-21:00",
+        },
+        now=datetime(2026, 5, 14, 10, 0, 0),
+    )
+
+    assert policy["allowed"] is False
+    assert policy["reason"] == "disabled"
+
+
+def test_group_and_individual_alert_intervals_are_independent():
+    config = {
+        "group_alert_send_every_batches": 2,
+        "individual_alert_send_every_batches": 5,
+    }
+
+    assert notification_service.get_group_alert_send_every_batches(config) == 2
+    assert notification_service.get_individual_alert_send_every_batches(config) == 5
+
+
+def test_filter_current_off_alerts_can_use_independent_start_key():
+    alerts = [
+        {"ma_tb": "GROUP_OLD", "first_off_time": "2026-05-14T06:30:00"},
+        {"ma_tb": "GROUP_KEEP", "first_off_time": "2026-05-14T07:30:00"},
+    ]
+
+    filtered = notification_service.filter_current_off_alerts_by_cutoff(
+        alerts,
+        {"group_alert_start_time": "07:00", "individual_alert_start_time": "06:00"},
+        start_time_key="group_alert_start_time",
+        now=datetime(2026, 5, 14, 8, 0, 0),
+    )
+
+    assert [alert["ma_tb"] for alert in filtered] == ["GROUP_KEEP"]
 
 
 def test_get_alert_policy_status_allows_overnight_window():

@@ -355,6 +355,39 @@ class AlertRepository:
             ).fetchall()
             return {row["sub"]: dict(row) for row in rows}
 
+    def fetch_authoritative_sub_by_ma_tb(self, ma_tbs: Sequence[str]) -> Dict[str, str]:
+        unique_ma_tbs = sorted(set(str(ma_tb).strip() for ma_tb in ma_tbs if str(ma_tb or "").strip()))
+        if not unique_ma_tbs:
+            return {}
+        source_path = Path(self.source_db_path)
+        if not source_path.exists():
+            return {}
+
+        subs_by_ma_tb: Dict[str, set] = {}
+        with sqlite3.connect(source_path, timeout=60) as conn:
+            conn.row_factory = sqlite3.Row
+            for ma_tb_chunk in _chunks(unique_ma_tbs):
+                placeholders = ",".join("?" for _ in ma_tb_chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT COALESCE(Ma_Tb, '') AS ma_tb, COALESCE(sub, '') AS sub
+                    FROM danhba
+                    WHERE Ma_Tb IN ({placeholders})
+                    ORDER BY ma_tb, sub
+                    """,
+                    tuple(ma_tb_chunk),
+                ).fetchall()
+                for row in rows:
+                    ma_tb = str(row["ma_tb"] or "").strip()
+                    sub = str(row["sub"] or "").strip()
+                    if ma_tb and sub:
+                        subs_by_ma_tb.setdefault(ma_tb, set()).add(sub)
+        return {
+            ma_tb: next(iter(subs))
+            for ma_tb, subs in subs_by_ma_tb.items()
+            if len(subs) == 1
+        }
+
     def get_state_row(self, subscriber_key: str) -> Optional[Dict]:
         with self.connect() as conn:
             row = conn.execute(
@@ -383,6 +416,55 @@ class AlertRepository:
                     ).fetchall()
                 )
         return {row["subscriber_key"]: dict(row) for row in rows}
+
+    def fetch_latest_port_recovery_times(
+        self,
+        parent_port_keys: Sequence[str],
+        before_time: datetime,
+        threshold: int,
+    ) -> Dict[str, datetime]:
+        unique_keys = sorted(set(key for key in parent_port_keys if key))
+        if not unique_keys or not before_time:
+            return {}
+
+        recovery_times: Dict[str, datetime] = {}
+        parent_expr = (
+            "CASE WHEN instr(\"Cổng\", ':') > 0 "
+            "THEN substr(\"Cổng\", 1, instr(\"Cổng\", ':') - 1) "
+            "ELSE \"Cổng\" END"
+        )
+        status_expr = "UPPER(COALESCE(onuStatusStr, ''))"
+        with self.connect() as conn:
+            for key_chunk in _chunks(unique_keys):
+                placeholders = ",".join("?" for _ in key_chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT parent_port_key, MAX(batch_measured_at) AS recovered_at
+                    FROM (
+                        SELECT
+                            {parent_expr} AS parent_port_key,
+                            batch_id,
+                            MAX(NgayDo || 'T' || ThoiGianDo) AS batch_measured_at,
+                            SUM(
+                                CASE
+                                    WHEN {status_expr} = 'PORT_DOWN' OR {status_expr} LIKE '%OFF%' THEN 1
+                                    ELSE 0
+                                END
+                            ) AS off_count
+                        FROM onu_measurements
+                        WHERE {parent_expr} IN ({placeholders})
+                        GROUP BY parent_port_key, batch_id
+                    )
+                    WHERE off_count <= ? AND batch_measured_at < ?
+                    GROUP BY parent_port_key
+                    """,
+                    (*key_chunk, threshold, _iso(before_time)),
+                ).fetchall()
+                for row in rows:
+                    recovered_at = _dt(row["recovered_at"])
+                    if recovered_at:
+                        recovery_times[row["parent_port_key"]] = recovered_at
+        return recovery_times
 
     def _state_params(self, state: Dict) -> tuple:
         return (

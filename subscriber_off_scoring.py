@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import median
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 DEFAULT_DB_PATH = "onu_measurements.db"
@@ -20,6 +20,7 @@ UNCERTAIN = "UNCERTAIN"
 MIN_HISTORY_EVENTS_FOR_SELF_POWER_OFF = 3
 MIN_SELF_POWER_OFF_SCORE = 70
 WIDE_AREA_PORT_OFF_THRESHOLD = 5
+MAJOR_INCIDENT_OFF_COUNT_THRESHOLD = 800
 
 SCORE_CSV_FIELDNAMES = [
     "ma_tb",
@@ -339,6 +340,86 @@ def _rows_to_history(rows: Iterable[sqlite3.Row]) -> Dict[str, List[OFFHistoryEv
     return history
 
 
+def _history_event_key(subscriber_key: str, outage_time) -> Optional[Tuple[str, str]]:
+    parsed = _parse_dt(outage_time)
+    if not subscriber_key or not parsed:
+        return None
+    return (subscriber_key, parsed.isoformat())
+
+
+def _load_major_incident_batch_ids(
+    conn: sqlite3.Connection,
+    off_count_threshold: int = MAJOR_INCIDENT_OFF_COUNT_THRESHOLD,
+) -> Set[str]:
+    if (
+        off_count_threshold <= 0
+        or not _table_exists(conn, "onu_measurements")
+    ):
+        return set()
+
+    if _table_exists(conn, "measurement_batches"):
+        rows = conn.execute(
+            """
+            SELECT m.batch_id
+            FROM onu_measurements m
+            JOIN measurement_batches mb ON mb.batch_id = m.batch_id
+            WHERE mb.status IN ('completed', 'alerted')
+            GROUP BY m.batch_id
+            HAVING SUM(CASE WHEN UPPER(TRIM(m.onuStatusStr)) = 'OFF' THEN 1 ELSE 0 END) >= ?
+            """,
+            (off_count_threshold,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT batch_id
+            FROM onu_measurements
+            GROUP BY batch_id
+            HAVING SUM(CASE WHEN UPPER(TRIM(onuStatusStr)) = 'OFF' THEN 1 ELSE 0 END) >= ?
+            """,
+            (off_count_threshold,),
+        ).fetchall()
+    return {row["batch_id"] for row in rows if row["batch_id"]}
+
+
+def _load_excluded_history_event_keys(
+    conn: sqlite3.Connection,
+    subscriber_keys: Sequence[str],
+    off_count_threshold: int = MAJOR_INCIDENT_OFF_COUNT_THRESHOLD,
+) -> Set[Tuple[str, str]]:
+    if not subscriber_keys or not _table_exists(conn, "outage_alerts"):
+        return set()
+
+    unique_keys = sorted(set(subscriber_keys))
+    placeholders = ",".join("?" for _ in unique_keys)
+    major_incident_batch_ids = _load_major_incident_batch_ids(conn, off_count_threshold)
+
+    where_parts = ["suppressed_by_wide_area = 1"]
+    params: List = list(unique_keys)
+    if major_incident_batch_ids:
+        batch_placeholders = ",".join("?" for _ in major_incident_batch_ids)
+        where_parts.append(f"batch_id IN ({batch_placeholders})")
+        params.extend(sorted(major_incident_batch_ids))
+
+    rows = conn.execute(
+        f"""
+        SELECT subscriber_key, first_off_time, alert_time
+        FROM outage_alerts
+        WHERE subscriber_key IN ({placeholders})
+          AND ({' OR '.join(where_parts)})
+        """,
+        tuple(params),
+    ).fetchall()
+
+    excluded_keys: Set[Tuple[str, str]] = set()
+    for row in rows:
+        for candidate_time in (row["first_off_time"], row["alert_time"]):
+            key = _history_event_key(row["subscriber_key"], candidate_time)
+            if key:
+                excluded_keys.add(key)
+    return excluded_keys
+
+
 def _load_history_by_subscriber(conn: sqlite3.Connection) -> Dict[str, List[OFFHistoryEvent]]:
     if not _table_exists(conn, "recovery_alerts"):
         return {}
@@ -351,6 +432,14 @@ def _load_history_by_subscriber(conn: sqlite3.Connection) -> Dict[str, List[OFFH
         ORDER BY subscriber_key, outage_time
         """
     ).fetchall()
+    subscriber_keys = [row["subscriber_key"] for row in rows]
+    excluded_event_keys = _load_excluded_history_event_keys(conn, subscriber_keys)
+    if excluded_event_keys:
+        rows = [
+            row
+            for row in rows
+            if _history_event_key(row["subscriber_key"], row["outage_time"]) not in excluded_event_keys
+        ]
     return _rows_to_history(rows)
 
 
@@ -382,6 +471,13 @@ def _load_history_for_subscribers(
         """,
         tuple(params),
     ).fetchall()
+    excluded_event_keys = _load_excluded_history_event_keys(conn, unique_keys)
+    if excluded_event_keys:
+        rows = [
+            row
+            for row in rows
+            if _history_event_key(row["subscriber_key"], row["outage_time"]) not in excluded_event_keys
+        ]
     return _rows_to_history(rows)
 
 
@@ -397,8 +493,12 @@ def _latest_history_metadata(conn: sqlite3.Connection) -> Dict[str, Dict]:
         ORDER BY subscriber_key, outage_time
         """
     ).fetchall()
+    subscriber_keys = [row["subscriber_key"] for row in rows]
+    excluded_event_keys = _load_excluded_history_event_keys(conn, subscriber_keys)
     metadata = {}
     for row in rows:
+        if _history_event_key(row["subscriber_key"], row["outage_time"]) in excluded_event_keys:
+            continue
         metadata[row["subscriber_key"]] = dict(row)
     return metadata
 

@@ -171,7 +171,7 @@ def test_dispatch_batch_notifications_returns_detailed_breakdown_and_logs(repo_p
         ).fetchall()
     assert sent == []
     assert any("wide-area pending=0" in message for message in messages)
-    assert any("individual outage pending_raw=1 pending_after_filters=1" in message for message in messages)
+    assert any("group outage pending_raw=1 pending_after_filters=1" in message for message in messages)
 
 
 def test_dispatch_batch_notifications_writes_jsonl_delivery_log(repo_paths, monkeypatch, tmp_path):
@@ -601,7 +601,7 @@ def test_dispatch_batch_notifications_counts_individual_cycle_globally_across_em
     assert next_batch_result["outage"]["marked_sent_alerts"] == 1
 
 
-def test_dispatch_batch_notifications_skips_individual_alerts_when_disabled(repo_paths, monkeypatch):
+def test_dispatch_batch_notifications_skips_personal_alerts_when_disabled(repo_paths, monkeypatch):
     repo, _measurement_db = repo_paths
 
     try:
@@ -641,10 +641,355 @@ def test_dispatch_batch_notifications_skips_individual_alerts_when_disabled(repo
     result = dispatch_batch_notifications(repo, "b2", log=messages.append)
 
     assert result["outage"]["raw_pending_alerts"] == 1
-    assert result["outage"]["filtered_pending_alerts"] == 0
-    assert result["outage"]["filtered_out_alerts"] == 1
-    assert result["outage"]["marked_sent_alerts"] == 0
+    assert result["outage"]["filtered_pending_alerts"] == 1
+    assert result["outage"]["filtered_out_alerts"] == 0
+    assert result["outage"]["marked_sent_alerts"] == 1
+    assert result["personal_outage"]["raw_pending_alerts"] == 1
+    assert result["personal_outage"]["filtered_pending_alerts"] == 0
+    assert result["personal_outage"]["filtered_out_alerts"] == 1
+    assert result["personal_outage"]["marked_sent_alerts"] == 0
     assert any("individual outage notifications disabled by config" in message for message in messages)
+
+
+def test_dispatch_batch_notifications_keeps_group_alerts_when_personal_disabled(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_rows = [
+        {
+            "batch_id": "b2",
+            "subscriber_key": "sub-1",
+            "ma_tb": "TB001",
+            "ten_tb": "Ten TB",
+            "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+            "ten_nvkt_db": "VNPT - Nguyen Van A",
+            "dienthoai_lh": "0912345678",
+            "diachi_ld": "Dia chi",
+            "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+            "first_off_time": "2026-04-24T12:05:00",
+            "duration_minutes": 25,
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+        }
+    ]
+
+    monkeypatch.setattr(notification_bridge, "load_current_off_snapshot_rows", lambda repo, batch_id: snapshot_rows)
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+            "enable_individual_alert_notifications": False,
+        },
+    )
+
+    result = dispatch_batch_notifications(repo, "b2", log=lambda _message: None)
+
+    assert result["outage"]["filtered_pending_alerts"] == 1
+    assert result["outage"]["marked_sent_alerts"] == 1
+    assert result["personal_outage"]["filtered_pending_alerts"] == 0
+    assert result["personal_outage"]["marked_sent_alerts"] == 0
+
+
+def test_dispatch_batch_notifications_keeps_personal_alerts_when_group_disabled(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_rows = [
+        {
+            "batch_id": "b2",
+            "subscriber_key": "sub-1",
+            "ma_tb": "TB001",
+            "ten_tb": "Ten TB",
+            "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+            "ten_nvkt_db": "VNPT - Nguyen Van A",
+            "dienthoai_lh": "0912345678",
+            "diachi_ld": "Dia chi",
+            "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+            "first_off_time": "2026-05-14T06:05:00",
+            "duration_minutes": 25,
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+        }
+    ]
+
+    monkeypatch.setattr(notification_bridge, "load_current_off_snapshot_rows", lambda repo, batch_id: snapshot_rows)
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": True,
+            "enable_group_alert_notifications": False,
+            "enable_individual_alert_notifications": True,
+            "group_alert_send_every_batches": 1,
+            "individual_alert_send_every_batches": 1,
+            "group_alert_start_time": "06:00",
+            "individual_alert_start_time": "06:00",
+        },
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "get_zalo_user_by_nvkt",
+        lambda nvkt, config=None: "user-a",
+    )
+
+    async def fake_send_zalo_message_to_user_detailed(message, user_id, client=None):
+        return {
+            "success": True,
+            "thread_id": user_id,
+            "message": message,
+            "stdout": "ok",
+            "stderr": "",
+            "returncode": 0,
+            "command": [],
+        }
+
+    async def fail_group_sender(alerts):
+        raise AssertionError("group sender should not be called when group alerts are disabled")
+
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "send_zalo_message_to_user_detailed",
+        fake_send_zalo_message_to_user_detailed,
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "send_current_off_snapshot_by_doi_vt",
+        fail_group_sender,
+    )
+
+    result = dispatch_batch_notifications(repo, "b2", log=lambda _message: None)
+
+    assert result["outage"]["filtered_pending_alerts"] == 0
+    assert result["outage"]["marked_sent_alerts"] == 0
+    assert result["personal_outage"]["filtered_pending_alerts"] == 1
+    assert result["personal_outage"]["marked_sent_alerts"] == 1
+
+
+def test_dispatch_batch_notifications_uses_independent_group_and_personal_cycles(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_rows = [
+        {
+            "batch_id": "b2",
+            "subscriber_key": "sub-1",
+            "ma_tb": "TB001",
+            "ten_tb": "Ten TB",
+            "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+            "ten_nvkt_db": "VNPT - Nguyen Van A",
+            "dienthoai_lh": "0912345678",
+            "diachi_ld": "Dia chi",
+            "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+            "first_off_time": "2026-05-14T06:05:00",
+            "duration_minutes": 25,
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+        }
+    ]
+
+    monkeypatch.setattr(notification_bridge, "load_current_off_snapshot_rows", lambda repo, batch_id: snapshot_rows)
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+            "enable_group_alert_notifications": True,
+            "enable_individual_alert_notifications": True,
+            "group_alert_send_every_batches": 2,
+            "individual_alert_send_every_batches": 3,
+            "group_alert_start_time": "06:00",
+            "individual_alert_start_time": "06:00",
+        },
+    )
+
+    first_result = dispatch_batch_notifications(repo, "b2", log=lambda _message: None)
+    second_result = dispatch_batch_notifications(repo, "b3", log=lambda _message: None)
+    third_result = dispatch_batch_notifications(repo, "b4", log=lambda _message: None)
+
+    assert first_result["outage"]["filtered_pending_alerts"] == 0
+    assert first_result["personal_outage"]["filtered_pending_alerts"] == 0
+    assert second_result["outage"]["filtered_pending_alerts"] == 1
+    assert second_result["personal_outage"]["filtered_pending_alerts"] == 0
+    assert third_result["outage"]["filtered_pending_alerts"] == 0
+    assert third_result["personal_outage"]["filtered_pending_alerts"] == 1
+
+
+def test_dispatch_batch_notifications_sends_personal_alerts_once_per_day(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_rows_by_batch = {
+        "b2": [
+            {
+                "batch_id": "b2",
+                "subscriber_key": "sub-1",
+                "ma_tb": "TB001",
+                "ten_tb": "Ten TB",
+                "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "dienthoai_lh": "0912345678",
+                "diachi_ld": "Dia chi",
+                "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+                "first_off_time": "2026-04-24T06:05:00",
+                "duration_minutes": 25,
+                "suppressed_by_pattern": False,
+                "suppressed_by_wide_area": False,
+            },
+            {
+                "batch_id": "b2",
+                "subscriber_key": "sub-old",
+                "ma_tb": "OLD",
+                "ten_tb": "Old TB",
+                "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "dienthoai_lh": "0912345678",
+                "diachi_ld": "Dia chi",
+                "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:2",
+                "first_off_time": "2026-04-24T05:59:00",
+                "duration_minutes": 30,
+                "suppressed_by_pattern": False,
+                "suppressed_by_wide_area": False,
+            },
+        ],
+        "b3": [
+            {
+                "batch_id": "b3",
+                "subscriber_key": "sub-1",
+                "ma_tb": "TB001",
+                "ten_tb": "Ten TB",
+                "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "dienthoai_lh": "0912345678",
+                "diachi_ld": "Dia chi",
+                "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+                "first_off_time": "2026-04-24T06:05:00",
+                "duration_minutes": 35,
+                "suppressed_by_pattern": False,
+                "suppressed_by_wide_area": False,
+            },
+            {
+                "batch_id": "b3",
+                "subscriber_key": "sub-2",
+                "ma_tb": "TB002",
+                "ten_tb": "Ten TB 2",
+                "doi_vt": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+                "ten_nvkt_db": "VNPT - Nguyen Van A",
+                "dienthoai_lh": "0987654321",
+                "diachi_ld": "Dia chi 2",
+                "port_id": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:3",
+                "first_off_time": "2026-04-24T06:25:00",
+                "duration_minutes": 15,
+                "suppressed_by_pattern": False,
+                "suppressed_by_wide_area": False,
+            },
+        ],
+    }
+
+    monkeypatch.setattr(
+        notification_bridge,
+        "load_current_off_snapshot_rows",
+        lambda repo, batch_id: snapshot_rows_by_batch.get(batch_id, []),
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": True,
+            "enable_individual_alert_notifications": True,
+            "current_off_alert_start_time": "06:00",
+            "individual_alert_time_window": "06:00-21:00",
+            "individual_alert_send_every_batches": 1,
+        },
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "get_zalo_user_by_nvkt",
+        lambda nvkt, config=None: "user-a" if nvkt in {"VNPT - Nguyen Van A", "Nguyen Van A"} else None,
+    )
+    async def fake_send_current_off_snapshot_by_doi_vt(alerts):
+        return {"sent": 1, "failed": 0, "no_thread": 0, "deliveries": []}
+
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "send_current_off_snapshot_by_doi_vt",
+        fake_send_current_off_snapshot_by_doi_vt,
+    )
+    original_filter = notification_bridge.notification_service.filter_current_off_alerts_by_cutoff
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "filter_current_off_alerts_by_cutoff",
+        lambda alerts, config=None, now=None, **kwargs: original_filter(
+            alerts,
+            config=config,
+            now=datetime(2026, 4, 24, 7, 30, 0),
+            start_time_key=kwargs.get("start_time_key", "current_off_alert_start_time"),
+        ),
+    )
+    original_key = notification_bridge.build_individual_alert_sent_state_key
+    monkeypatch.setattr(
+        notification_bridge,
+        "build_individual_alert_sent_state_key",
+        lambda config=None, now=None: original_key(
+            config=config,
+            now=datetime(2026, 4, 24, 7, 30, 0),
+        ),
+    )
+
+    sent_messages = []
+
+    async def fake_send_zalo_message_to_user_detailed(message, user_id, client=None):
+        sent_messages.append((user_id, message))
+        return {
+            "success": True,
+            "thread_id": user_id,
+            "message": message,
+            "stdout": "ok",
+            "stderr": "",
+            "returncode": 0,
+            "command": [],
+        }
+
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "send_zalo_message_to_user_detailed",
+        fake_send_zalo_message_to_user_detailed,
+    )
+
+    first_result = dispatch_batch_notifications(repo, "b2", log=lambda _message: None)
+    second_result = dispatch_batch_notifications(repo, "b3", log=lambda _message: None)
+
+    assert first_result["personal_outage"]["raw_pending_alerts"] == 2
+    assert first_result["personal_outage"]["filtered_pending_alerts"] == 1
+    assert first_result["personal_outage"]["marked_sent_alerts"] == 1
+    assert second_result["personal_outage"]["raw_pending_alerts"] == 2
+    assert second_result["personal_outage"]["filtered_pending_alerts"] == 1
+    assert second_result["personal_outage"]["marked_sent_alerts"] == 1
+    assert len(sent_messages) == 2
+    assert "TB001" in sent_messages[0][1]
+    assert "OLD" not in sent_messages[0][1]
+    assert "TB002" in sent_messages[1][1]
+    assert "TB001" not in sent_messages[1][1]
 
 
 def test_dispatch_batch_notifications_filters_current_off_rows_by_today_cutoff(repo_paths, monkeypatch):
@@ -700,10 +1045,11 @@ def test_dispatch_batch_notifications_filters_current_off_rows_by_today_cutoff(r
     monkeypatch.setattr(
         notification_bridge.notification_service,
         "filter_current_off_alerts_by_cutoff",
-        lambda alerts, config=None, now=None: original_filter(
+        lambda alerts, config=None, now=None, **kwargs: original_filter(
             alerts,
             config=config,
             now=datetime(2026, 4, 26, 7, 30, 0),
+            start_time_key=kwargs.get("start_time_key", "current_off_alert_start_time"),
         ),
     )
 
@@ -714,7 +1060,7 @@ def test_dispatch_batch_notifications_filters_current_off_rows_by_today_cutoff(r
     assert result["outage"]["filtered_pending_alerts"] == 1
     assert result["outage"]["filtered_out_alerts"] == 1
     assert result["outage"]["marked_sent_alerts"] == 1
-    assert any("individual outage cutoff=" in message and "filtered_by_cutoff=1" in message for message in messages)
+    assert any("group outage cutoff=" in message and "filtered_by_cutoff=1" in message for message in messages)
 
 
 def test_dispatch_batch_notifications_excludes_suppressed_current_off_rows(repo_paths, monkeypatch):

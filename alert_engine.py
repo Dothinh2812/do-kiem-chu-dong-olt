@@ -2,7 +2,7 @@ import os
 from collections import defaultdict
 from datetime import datetime
 from time import perf_counter
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
     from .alert_db import AlertRepository
@@ -103,6 +103,7 @@ def _parse_optional_dt(value):
 def _snapshot_from_row(row: Dict, metadata: Dict) -> SubscriberSnapshot:
     subscriber_key = row["subscriber_key"]
     doi_vt = normalize_doi_vt_name(metadata.get("DOI_VT") or "")
+    ma_tb = (metadata.get("Ma_Tb") or "").strip() or (row.get("accountFiber") or "").strip()
     return SubscriberSnapshot(
         subscriber_key=subscriber_key,
         parent_port_key=get_parent_port_key(subscriber_key),
@@ -110,7 +111,7 @@ def _snapshot_from_row(row: Dict, metadata: Dict) -> SubscriberSnapshot:
         batch_id=row["batch_id"],
         status=normalize_status(row.get("onuStatusStr")),
         measured_at=_parse_measured_at(row),
-        ma_tb=(metadata.get("Ma_Tb") or "").strip(),
+        ma_tb=ma_tb,
         ten_tb=(metadata.get("Ten_Tb") or "").strip(),
         ma_men=(metadata.get("Ma_Men") or "").strip(),
         doi_vt=doi_vt,
@@ -121,6 +122,22 @@ def _snapshot_from_row(row: Dict, metadata: Dict) -> SubscriberSnapshot:
         onu_last_off=(row.get("onuLastOff") or "").strip(),
         onu_last_on=(row.get("onuLastOn") or "").strip(),
     )
+
+
+def _partition_by_authoritative_assignment(
+    snapshots: Iterable[SubscriberSnapshot],
+    authoritative_sub_by_ma_tb: Dict[str, str],
+) -> Tuple[List[SubscriberSnapshot], List[Tuple[SubscriberSnapshot, str]]]:
+    valid_snapshots: List[SubscriberSnapshot] = []
+    stale_snapshots: List[Tuple[SubscriberSnapshot, str]] = []
+    for snapshot in snapshots:
+        ma_tb = (snapshot.ma_tb or "").strip()
+        authoritative_sub = authoritative_sub_by_ma_tb.get(ma_tb)
+        if ma_tb and authoritative_sub and snapshot.subscriber_key != authoritative_sub:
+            stale_snapshots.append((snapshot, authoritative_sub))
+            continue
+        valid_snapshots.append(snapshot)
+    return valid_snapshots, stale_snapshots
 
 
 def _parse_device_event_time(value) -> Optional[datetime]:
@@ -330,10 +347,12 @@ def _detect_wide_area(
     threshold: int,
     state_rows: Optional[Dict[str, Dict]] = None,
     blocked_ma_tbs: Optional[Iterable[str]] = None,
+    port_recovery_times: Optional[Dict[str, datetime]] = None,
 ) -> List[WideAreaAlert]:
     grouped = defaultdict(list)
     state_rows = state_rows or {}
     blocked = {ma_tb for ma_tb in (blocked_ma_tbs or []) if ma_tb}
+    port_recovery_times = port_recovery_times or {}
     for snapshot in snapshot_offs:
         if snapshot.ma_tb and snapshot.ma_tb not in blocked:
             grouped[snapshot.parent_port_key].append(snapshot)
@@ -401,7 +420,12 @@ def _detect_wide_area(
             for snapshot in qualified_snapshots
         ]
         first_off_candidates = [dt for dt in first_off_candidates if dt is not None]
+        recovery_boundary = port_recovery_times.get(parent_port_key)
+        if recovery_boundary:
+            first_off_candidates = [dt for dt in first_off_candidates if dt > recovery_boundary]
         first_off_time = min(first_off_candidates) if first_off_candidates else None
+        if recovery_boundary and first_off_time is None:
+            first_off_time = first.measured_at
         off_duration_minutes = 0
         if first_off_time and first.measured_at:
             off_duration_minutes = max(int((first.measured_at - first_off_time).total_seconds() // 60), 0)
@@ -456,7 +480,26 @@ def process_completed_batch(
     _emit(log, f"[ALERT] Batch {batch_id}: snapshots={len(raw_rows)}")
     _emit(log, f"[ALERT] Batch {batch_id}: enriching subscriber metadata...")
     metadata_map = repo.fetch_metadata_map(subscriber_keys)
-    snapshots = [_snapshot_from_row(row, metadata_map.get(row["subscriber_key"], {})) for row in raw_rows]
+    all_snapshots = [_snapshot_from_row(row, metadata_map.get(row["subscriber_key"], {})) for row in raw_rows]
+    authoritative_sub_by_ma_tb = repo.fetch_authoritative_sub_by_ma_tb(
+        snapshot.ma_tb for snapshot in all_snapshots
+    )
+    snapshots, stale_assignment_snapshots = _partition_by_authoritative_assignment(
+        all_snapshots,
+        authoritative_sub_by_ma_tb,
+    )
+    stale_assignment_suppressed = len(stale_assignment_snapshots)
+    _emit(
+        log,
+        f"[ALERT] Batch {batch_id}: assignment filter valid={len(snapshots)} "
+        f"stale_assignment_suppressed={stale_assignment_suppressed}",
+    )
+    if stale_assignment_snapshots:
+        stale_examples = "; ".join(
+            f"{snapshot.ma_tb} {snapshot.subscriber_key} -> {authoritative_sub}"
+            for snapshot, authoritative_sub in stale_assignment_snapshots[:5]
+        )
+        _emit(log, f"[ALERT] Batch {batch_id}: stale assignment examples: {stale_examples}")
 
     outage_count = 0
     recovery_count = 0
@@ -512,6 +555,12 @@ def process_completed_batch(
         for snapshot in current_offs
         if snapshot.subscriber_key in next_state_rows
     }
+    measured_at = max((snapshot.measured_at for snapshot in all_snapshots), default=None)
+    port_recovery_times = repo.fetch_latest_port_recovery_times(
+        [snapshot.parent_port_key for snapshot in current_offs],
+        measured_at,
+        wide_area_threshold,
+    )
 
     _emit(log, f"[ALERT] Batch {batch_id}: detecting wide-area outages...")
     wide_area_alerts = _detect_wide_area(
@@ -520,6 +569,7 @@ def process_completed_batch(
         wide_area_threshold,
         state_rows=state_rows,
         blocked_ma_tbs=on_ma_tbs,
+        port_recovery_times=port_recovery_times,
     )
     for alert in wide_area_alerts:
         repo.insert_wide_area_alert(alert)
@@ -531,9 +581,16 @@ def process_completed_batch(
         for alert in wide_area_alerts
         for subscriber_key in alert.subscriber_keys
     }
+    wide_area_timing_by_subscriber = {
+        subscriber_key: {
+            "first_off_time": alert.first_off_time,
+            "duration_minutes": alert.off_duration_minutes,
+        }
+        for alert in wide_area_alerts
+        for subscriber_key in alert.subscriber_keys
+    }
 
     _emit(log, f"[ALERT] Batch {batch_id}: applying pattern exclusion...")
-    measured_at = max((snapshot.measured_at for snapshot in snapshots), default=None)
     to_suppress, scoring_results = score_pattern_suppression_for_current_offs(
         db_path,
         current_offs,
@@ -573,12 +630,14 @@ def process_completed_batch(
         state_rows,
         exclusion_list=exclusion_list,
         wide_area_subscriber_keys=wide_area_subscriber_keys,
+        wide_area_timing_by_subscriber=wide_area_timing_by_subscriber,
     )
     current_off_snapshot_file = str(get_snapshot_output_path(os.path.dirname(db_path) or "."))
     current_off_snapshot_payload = build_snapshot_payload(
         batch_id,
         measured_at,
         current_off_snapshot_rows,
+        stale_assignment_suppressed=stale_assignment_suppressed,
     )
     write_snapshot_json(current_off_snapshot_payload, current_off_snapshot_file)
 
@@ -592,8 +651,9 @@ def process_completed_batch(
     _emit(
         log,
         "[ALERT] Batch "
-        f"{batch_id}: finished: snapshots={len(snapshots)} "
+        f"{batch_id}: finished: snapshots={len(raw_rows)} "
         f"state_rows_processed={processed_count} current_off={len(current_offs)} "
+        f"stale_assignment_suppressed={stale_assignment_suppressed} "
         f"wide_area_created={len(wide_area_alerts)} outage_created={outage_count} "
         f"recovery_created={recovery_count} current_off_snapshot={len(current_off_snapshot_rows)} "
         f"duration={duration_seconds}s",
@@ -601,9 +661,10 @@ def process_completed_batch(
     return {
         "batch_id": batch_id,
         "status": "processed",
-        "snapshots": len(snapshots),
+        "snapshots": len(raw_rows),
         "state_rows_processed": processed_count,
         "unknown_snapshots_skipped": unknown_count,
+        "stale_assignment_suppressed": stale_assignment_suppressed,
         "current_off_count": len(current_offs),
         "outage_alerts_created": outage_count,
         "recovery_alerts_created": recovery_count,

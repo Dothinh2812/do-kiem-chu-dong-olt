@@ -1,5 +1,8 @@
 import asyncio
+import json
 import os
+from collections import defaultdict
+from datetime import datetime
 from typing import Dict, List
 
 try:
@@ -29,6 +32,110 @@ def filter_active_current_off_snapshot_rows(rows: List[Dict]) -> List[Dict]:
     ]
 
 
+def _subscriber_identity(row: Dict) -> str:
+    return str(row.get("subscriber_key") or row.get("ma_tb") or "").strip()
+
+
+def _load_sent_subscriber_identities(repo: AlertRepository, state_key: str) -> set[str]:
+    raw_value = repo.get_runtime_state(state_key, "[]")
+    try:
+        payload = json.loads(raw_value or "[]")
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(payload, list):
+        return set()
+    return {str(value).strip() for value in payload if str(value).strip()}
+
+
+def _store_sent_subscriber_identities(repo: AlertRepository, state_key: str, identities: set[str]):
+    repo.set_runtime_state(state_key, json.dumps(sorted(identities), ensure_ascii=False))
+
+
+def build_individual_alert_sent_state_key(config: Dict = None, now: datetime = None) -> str:
+    active_config = config or notification_service.load_config()
+    cutoff = notification_service.get_current_off_alert_cutoff(
+        active_config,
+        now=now,
+        start_time_key="individual_alert_start_time",
+    )
+    current = now or datetime.now()
+    start_label = str(active_config.get("individual_alert_start_time", "") or "all").strip() or "all"
+    day = (cutoff.date() if cutoff else current.date()).isoformat()
+    return f"individual_alert_sent_subscribers:{day}:{start_label}"
+
+
+def filter_unsent_individual_alert_rows(repo: AlertRepository, rows: List[Dict], state_key: str) -> List[Dict]:
+    sent_identities = _load_sent_subscriber_identities(repo, state_key)
+    return [row for row in rows if _subscriber_identity(row) and _subscriber_identity(row) not in sent_identities]
+
+
+def mark_individual_alert_rows_sent(repo: AlertRepository, rows: List[Dict], state_key: str):
+    sent_identities = _load_sent_subscriber_identities(repo, state_key)
+    sent_identities.update(_subscriber_identity(row) for row in rows if _subscriber_identity(row))
+    _store_sent_subscriber_identities(repo, state_key, sent_identities)
+
+
+async def send_personal_current_off_alerts(alerts: List[Dict], batch_id: str, config: Dict) -> Dict:
+    results = {"sent": 0, "failed": 0, "no_user": 0, "deliveries": [], "sent_rows": []}
+    groups = defaultdict(list)
+    for alert in alerts:
+        nvkt = notification_service._short_nvkt(alert.get("ten_nvkt_db", "") or "")
+        groups[nvkt or "Chưa gán NVKT"].append(alert)
+
+    for nvkt, items in groups.items():
+        user_id = notification_service.get_zalo_user_by_nvkt(nvkt, config=config)
+        message = notification_service.format_current_off_snapshot_by_nvkt(items, for_zalo=True)
+        if not user_id:
+            results["no_user"] += 1
+            results["deliveries"].append(
+                {
+                    "batch_id": batch_id,
+                    "channel": "zalo",
+                    "alert_type": "personal_outage",
+                    "target_id": "",
+                    "nvkt": nvkt,
+                    "status": "NO_USER",
+                    "message_full": message,
+                    "alert_ids": [],
+                    "alert_count": len(items),
+                    "error": "NVKT not mapped",
+                    "stdout": "",
+                    "stderr": "",
+                    "returncode": None,
+                    "command": [],
+                }
+            )
+            continue
+
+        delivery_result = await notification_service.send_zalo_message_to_user_detailed(message, user_id)
+        success = delivery_result.get("success", False)
+        if success:
+            results["sent"] += 1
+            results["sent_rows"].extend(items)
+        else:
+            results["failed"] += 1
+        results["deliveries"].append(
+            {
+                "batch_id": batch_id,
+                "channel": "zalo",
+                "alert_type": "personal_outage",
+                "target_id": user_id,
+                "nvkt": nvkt,
+                "status": "SUCCESS" if success else "FAILED",
+                "message_full": message,
+                "alert_ids": [],
+                "alert_count": len(items),
+                "error": delivery_result.get("error", ""),
+                "stdout": delivery_result.get("stdout", ""),
+                "stderr": delivery_result.get("stderr", ""),
+                "returncode": delivery_result.get("returncode"),
+                "command": delivery_result.get("command", []),
+            }
+        )
+
+    return results
+
+
 async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     results = {
         "wide_area": {
@@ -50,6 +157,15 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             "zalo_groups_sent": 0,
             "zalo_groups_failed": 0,
             "no_thread_groups": 0,
+        },
+        "personal_outage": {
+            "raw_pending_alerts": 0,
+            "filtered_pending_alerts": 0,
+            "filtered_out_alerts": 0,
+            "marked_sent_alerts": 0,
+            "zalo_messages_sent": 0,
+            "zalo_messages_failed": 0,
+            "no_user": 0,
         },
         "recovery": {
             "pending_alerts": 0,
@@ -208,47 +324,51 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
 
     raw_outage_alerts = load_current_off_snapshot_rows(repo, batch_id)
     active_outage_alerts = filter_active_current_off_snapshot_rows(raw_outage_alerts)
-    outage_policy = notification_service.get_alert_policy_status("outage", config)
-    outage_cycle = repo.advance_notification_cycle("individual_alert", batch_id)
-    outage_interval = notification_service.get_individual_alert_send_every_batches(config)
+    group_policy = notification_service.get_alert_policy_status("group_outage", config)
+    outage_cycle = repo.advance_notification_cycle("group_alert", batch_id)
+    outage_interval = notification_service.get_group_alert_send_every_batches(config)
     cycle_allows_send = outage_cycle % outage_interval == 0
     cutoff_filtered_outage_alerts = (
-        notification_service.filter_current_off_alerts_by_cutoff(active_outage_alerts, config=config)
-        if outage_policy["allowed"]
+        notification_service.filter_current_off_alerts_by_cutoff(
+            active_outage_alerts,
+            config=config,
+            start_time_key="group_alert_start_time",
+        )
+        if group_policy["allowed"]
         else []
     )
-    outage_alerts = cutoff_filtered_outage_alerts if outage_policy["allowed"] and cycle_allows_send else []
+    outage_alerts = cutoff_filtered_outage_alerts if group_policy["allowed"] and cycle_allows_send else []
     results["outage"]["raw_pending_alerts"] = len(raw_outage_alerts)
     results["outage"]["filtered_pending_alerts"] = len(outage_alerts)
     results["outage"]["filtered_out_alerts"] = len(raw_outage_alerts) - len(outage_alerts)
-    cutoff = notification_service.get_current_off_alert_cutoff(config)
-    if outage_policy["allowed"] and cutoff is not None:
+    cutoff = notification_service.get_current_off_alert_cutoff(config, start_time_key="group_alert_start_time")
+    if group_policy["allowed"] and cutoff is not None:
         _emit(
             log,
             "[NOTIFY] Batch "
-            f"{batch_id}: individual outage cutoff={cutoff} "
+            f"{batch_id}: group outage cutoff={cutoff} "
             f"filtered_by_cutoff={len(active_outage_alerts) - len(outage_alerts)}",
         )
-    if outage_policy["allowed"] and raw_outage_alerts:
+    if raw_outage_alerts and not group_policy["allowed"]:
+        _emit(log, f"[NOTIFY] Batch {batch_id}: {group_policy['message']}")
+    if group_policy["allowed"] and raw_outage_alerts:
         _emit(
             log,
             "[NOTIFY] Batch "
-            f"{batch_id}: individual outage cycle={outage_cycle} "
+            f"{batch_id}: group outage cycle={outage_cycle} "
             f"interval={outage_interval} cycle_allows_send={cycle_allows_send}",
         )
     _emit(
         log,
         "[NOTIFY] Batch "
-        f"{batch_id}: individual outage pending_raw={len(raw_outage_alerts)} "
+        f"{batch_id}: group outage pending_raw={len(raw_outage_alerts)} "
         f"pending_after_filters={len(outage_alerts)} filtered_out={len(raw_outage_alerts) - len(outage_alerts)}",
     )
-    if raw_outage_alerts and not outage_policy["allowed"]:
-        _emit(log, f"[NOTIFY] Batch {batch_id}: {outage_policy['message']}")
-    if cutoff_filtered_outage_alerts and outage_policy["allowed"] and not cycle_allows_send:
+    if cutoff_filtered_outage_alerts and group_policy["allowed"] and not cycle_allows_send:
         _emit(
             log,
             "[NOTIFY] Batch "
-            f"{batch_id}: individual outage notifications waiting for cycle "
+            f"{batch_id}: group outage notifications waiting for cycle "
             f"{outage_interval} (current_cycle={outage_cycle})",
         )
     if outage_alerts:
@@ -299,6 +419,72 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             f"zalo_groups_sent={zalo_results.get('sent', 0)} "
             f"failed={zalo_results.get('failed', 0)} "
             f"no_thread={zalo_results.get('no_thread', 0)}",
+        )
+
+    personal_policy = notification_service.get_alert_policy_status("outage", config)
+    personal_cycle = repo.advance_notification_cycle("personal_individual_alert", batch_id)
+    personal_interval = notification_service.get_individual_alert_send_every_batches(config)
+    personal_cycle_allows_send = personal_cycle % personal_interval == 0
+    personal_cutoff_filtered_alerts = (
+        notification_service.filter_current_off_alerts_by_cutoff(
+            active_outage_alerts,
+            config=config,
+            start_time_key="individual_alert_start_time",
+        )
+        if personal_policy["allowed"]
+        else []
+    )
+    personal_state_key = build_individual_alert_sent_state_key(config=config)
+    personal_unsent_alerts = (
+        filter_unsent_individual_alert_rows(repo, personal_cutoff_filtered_alerts, personal_state_key)
+        if personal_policy["allowed"] and personal_cycle_allows_send
+        else []
+    )
+    results["personal_outage"]["raw_pending_alerts"] = len(raw_outage_alerts)
+    results["personal_outage"]["filtered_pending_alerts"] = len(personal_unsent_alerts)
+    results["personal_outage"]["filtered_out_alerts"] = len(raw_outage_alerts) - len(personal_unsent_alerts)
+    if raw_outage_alerts and not personal_policy["allowed"]:
+        _emit(log, f"[NOTIFY] Batch {batch_id}: {personal_policy['message']}")
+    if personal_policy["allowed"] and raw_outage_alerts:
+        _emit(
+            log,
+            "[NOTIFY] Batch "
+            f"{batch_id}: personal outage cycle={personal_cycle} interval={personal_interval} "
+            f"cycle_allows_send={personal_cycle_allows_send} state_key={personal_state_key}",
+        )
+    if personal_cutoff_filtered_alerts and personal_policy["allowed"] and not personal_cycle_allows_send:
+        _emit(
+            log,
+            "[NOTIFY] Batch "
+            f"{batch_id}: personal outage notifications waiting for cycle "
+            f"{personal_interval} (current_cycle={personal_cycle})",
+        )
+    if personal_unsent_alerts:
+        personal_results = {"sent": 0, "failed": 0, "no_user": 0, "deliveries": [], "sent_rows": []}
+        if config.get("enable_zalo", True):
+            personal_results = await send_personal_current_off_alerts(personal_unsent_alerts, batch_id, config)
+            for delivery in personal_results.get("deliveries", []):
+                notification_service.append_notification_delivery_log(delivery)
+        elif not config.get("enable_telegram", True):
+            personal_results["sent_rows"] = list(personal_unsent_alerts)
+        rows_to_mark_sent = personal_results.get("sent_rows", [])
+        if rows_to_mark_sent:
+            mark_individual_alert_rows_sent(repo, rows_to_mark_sent, personal_state_key)
+        results["personal_outage"].update(
+            {
+                "marked_sent_alerts": len(rows_to_mark_sent),
+                "zalo_messages_sent": personal_results.get("sent", 0),
+                "zalo_messages_failed": personal_results.get("failed", 0),
+                "no_user": personal_results.get("no_user", 0),
+            }
+        )
+        _emit(
+            log,
+            "[NOTIFY] Batch "
+            f"{batch_id}: personal outage sent={results['personal_outage']['marked_sent_alerts']} "
+            f"zalo_sent={personal_results.get('sent', 0)} "
+            f"failed={personal_results.get('failed', 0)} "
+            f"no_user={personal_results.get('no_user', 0)}",
         )
 
     recovery_alerts = repo.list_unsent_recovery_alerts(batch_id)

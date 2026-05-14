@@ -135,6 +135,26 @@ def create_scoring_schema(db_path):
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
+            CREATE TABLE measurement_batches (
+                batch_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE onu_measurements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "Cổng" TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                onuStatusStr TEXT,
+                NgayDo TEXT,
+                ThoiGianDo TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE recovery_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 subscriber_key TEXT NOT NULL,
@@ -232,6 +252,30 @@ def insert_outage(conn, subscriber_key, ma_tb, batch_id, first_off_time, parent_
     )
 
 
+def insert_batch_measurements(conn, batch_id, off_count, status="alerted"):
+    conn.execute(
+        "INSERT INTO measurement_batches (batch_id, status) VALUES (?, ?)",
+        (batch_id, status),
+    )
+    rows = [
+        (
+            f"subscriber-{batch_id}-{idx}",
+            batch_id,
+            "OFF" if idx < off_count else "ON",
+            "2026-04-23",
+            "20:00:00",
+        )
+        for idx in range(off_count)
+    ]
+    conn.executemany(
+        """
+        INSERT INTO onu_measurements ("Cổng", batch_id, onuStatusStr, NgayDo, ThoiGianDo)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
 def test_score_outage_alerts_uses_only_current_batch_and_30_day_history(tmp_path):
     db_path = tmp_path / "onu_measurements.db"
     create_scoring_schema(db_path)
@@ -272,6 +316,87 @@ def test_score_outage_alerts_uses_only_current_batch_and_30_day_history(tmp_path
 
     assert [result.subscriber_key for result in results] == ["sub-current"]
     assert results[0].features["history_event_count"] == 3
+
+
+def test_score_outage_alerts_ignores_wide_area_history_events(tmp_path):
+    db_path = tmp_path / "onu_measurements.db"
+    create_scoring_schema(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        insert_batch_measurements(conn, "incident-history", 700)
+        insert_batch_measurements(conn, "normal-history-1", 700)
+        insert_batch_measurements(conn, "normal-history-2", 700)
+        insert_batch_measurements(conn, "b10", 700)
+        for idx in range(3):
+            insert_history(conn, "sub-current", "TB100", idx, hour=20, minutes=15)
+        incident_outage_time = datetime(2026, 4, 20, 20, 5, 0).isoformat()
+        conn.execute(
+            """
+            INSERT INTO outage_alerts (
+                subscriber_key, parent_port_key, batch_id, ma_tb, ten_tb, first_off_time, alert_time, suppressed_by_wide_area
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "sub-current",
+                "port-1",
+                "incident-history",
+                "TB100",
+                "Khach hang",
+                incident_outage_time,
+                incident_outage_time,
+                1,
+            ),
+        )
+        insert_outage(conn, "sub-current", "TB100", "b10", "2026-04-23T20:08:00")
+        conn.commit()
+
+    results = score_outage_alerts(
+        str(db_path),
+        batch_id="b10",
+        reference_time=datetime(2026, 4, 23, 20, 25, 0),
+    )
+
+    assert results[0].features["history_event_count"] == 2
+
+
+def test_score_outage_alerts_ignores_major_incident_history_batches(tmp_path):
+    db_path = tmp_path / "onu_measurements.db"
+    create_scoring_schema(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        insert_batch_measurements(conn, "incident-history", 1000)
+        insert_batch_measurements(conn, "normal-history-1", 700)
+        insert_batch_measurements(conn, "normal-history-2", 700)
+        insert_batch_measurements(conn, "b10", 700)
+        for idx in range(3):
+            insert_history(conn, "sub-current", "TB100", idx, hour=20, minutes=15)
+        incident_outage_time = datetime(2026, 4, 20, 20, 5, 0).isoformat()
+        conn.execute(
+            """
+            INSERT INTO outage_alerts (
+                subscriber_key, parent_port_key, batch_id, ma_tb, ten_tb, first_off_time, alert_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "sub-current",
+                "port-1",
+                "incident-history",
+                "TB100",
+                "Khach hang",
+                incident_outage_time,
+                incident_outage_time,
+            ),
+        )
+        insert_outage(conn, "sub-current", "TB100", "b10", "2026-04-23T20:08:00")
+        conn.commit()
+
+    results = score_outage_alerts(
+        str(db_path),
+        batch_id="b10",
+        reference_time=datetime(2026, 4, 23, 20, 25, 0),
+    )
+
+    assert results[0].features["history_event_count"] == 2
 
 
 def test_update_exclusion_table_scores_likely_self_poweroff_rows(tmp_path):
