@@ -20,12 +20,24 @@ try:
     from .alert_db import AlertRepository
     from .alert_engine import process_completed_batch
     from .config import Config
-    from .login import read_otp_from_file
+    from .login import (
+        OTP_CONFIRM_BUTTON_SELECTORS,
+        OTP_FIELD_SELECTORS,
+        _click_first_visible_button,
+        _first_visible_locator,
+        read_otp_from_file,
+    )
 except ImportError:
     from alert_db import AlertRepository
     from alert_engine import process_completed_batch
     from config import Config
-    from login import read_otp_from_file
+    from login import (
+        OTP_CONFIRM_BUTTON_SELECTORS,
+        OTP_FIELD_SELECTORS,
+        _click_first_visible_button,
+        _first_visible_locator,
+        read_otp_from_file,
+    )
 
 # Parallel download settings
 NUM_THREADS = 64
@@ -863,20 +875,30 @@ def perform_browser_login(headless=True):
     print("\n[LOGIN] Session expired or missing. Opening browser login flow...")
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=headless)
-    context = browser.new_context()
+    context = browser.new_context(accept_downloads=True)
     page = context.new_page()
 
     login_url = getattr(Config, "BAOCAO_URL", "https://cts.vnpt.vn")
     print(f"     Opening {login_url} ...")
     page.goto(login_url, timeout=getattr(Config, "PAGE_LOAD_TIMEOUT", 60000))
-    page.wait_for_load_state("networkidle")
+    page.wait_for_load_state("networkidle", timeout=getattr(Config, "PAGE_LOAD_TIMEOUT", 60000))
 
     try:
-        page.locator('//*[@id="username"]').fill(getattr(Config, "BAOCAO_USERNAME", ""))
+        username_field = _first_visible_locator(page, ('//*[@id="username"]', "#username"))
+        username_field.fill(getattr(Config, "BAOCAO_USERNAME", ""))
         time.sleep(1)
-        page.locator('//*[@id="password"]').fill(getattr(Config, "BAOCAO_PASSWORD", ""))
+        password_field = _first_visible_locator(page, ('//*[@id="password"]', "#password"))
+        password_field.fill(getattr(Config, "BAOCAO_PASSWORD", ""))
         time.sleep(1)
-        page.locator('//*[@id="fm1"]/section/button').click()
+        _click_first_visible_button(
+            page,
+            (
+                '//*[@id="fm1"]/section/button',
+                '#fm1 button[type="submit"]',
+                '#fm1 button',
+                'button[type="submit"]',
+            ),
+        )
         time.sleep(3)
 
         otp_code = None
@@ -884,9 +906,10 @@ def perform_browser_login(headless=True):
             otp_code = read_otp_from_file()
 
         if otp_code:
-            page.locator('//*[@id="passOTP"]').fill(otp_code)
+            otp_field = _first_visible_locator(page, OTP_FIELD_SELECTORS)
+            otp_field.fill(otp_code)
             time.sleep(1)
-            page.locator('//*[@id="loginForm"]/div[1]/button').click()
+            _click_first_visible_button(page, OTP_CONFIRM_BUTTON_SELECTORS)
             time.sleep(5)
         else:
             print("     Please complete OTP/Captcha manually in the browser. Waiting 20s...")
@@ -895,7 +918,7 @@ def perform_browser_login(headless=True):
         print("     Please complete login manually in the browser. Waiting 20s...")
         time.sleep(20)
 
-    page.wait_for_load_state("networkidle")
+    page.wait_for_load_state("networkidle", timeout=getattr(Config, "PAGE_LOAD_TIMEOUT", 60000))
     print("     Login complete. Refreshing shared cookies for worker threads...")
 
     new_cookies = {}

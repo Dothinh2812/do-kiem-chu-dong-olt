@@ -888,6 +888,46 @@ def format_current_off_snapshot_by_nvkt(alerts: List, for_zalo: bool = False) ->
     return format_consolidated_outage_by_nvkt(alerts, for_zalo=for_zalo)
 
 
+def _format_power_value(value) -> str:
+    if value is None or value == "":
+        return "N/A"
+    try:
+        return f"{float(value):.2f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def format_weak_signal_by_nvkt(alerts: List, for_zalo: bool = False) -> str:
+    if not alerts:
+        return ""
+
+    first = alerts[0]
+    nvkt = _short_nvkt(_value(first, "ten_nvkt_db", "") or "") or "Chưa gán NVKT"
+    lines = [
+        "Suy hao cao",
+        f"NVKT: {nvkt}",
+        f"Số thuê bao: {len(alerts)}",
+        "",
+    ]
+    for idx, alert in enumerate(alerts, 1):
+        ma_tb = _value(alert, "ma_tb", "") or _value(alert, "accountFiber", "") or _value(alert, "subscriber_key", "")
+        ten_tb = _value(alert, "ten_tb", "")
+        port_id = get_port_display_name(_value(alert, "port_id", "") or _value(alert, "subscriber_key", ""))
+        olt_power = _format_power_value(_value(alert, "oltPowerRx", None))
+        onu_power = _format_power_value(_value(alert, "onuPowerRx", None))
+        phone = _value(alert, "dienthoai_lh", "")
+        address = _value(alert, "diachi_ld", "")
+        lines.append(f"{idx}. {ma_tb} - {ten_tb}".rstrip(" -"))
+        lines.append(f"Port: {port_id}")
+        lines.append(f"OLT RX: {olt_power} dBm | ONU RX: {onu_power} dBm")
+        if phone:
+            lines.append(f"ĐT: {phone}")
+        if address:
+            lines.append(f"ĐC: {address}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def format_current_off_snapshot_for_doi(alerts: List, doi_vt: str) -> str:
     return format_consolidated_outage_for_doi(alerts, doi_vt)
 

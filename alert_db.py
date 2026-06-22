@@ -336,6 +336,36 @@ class AlertRepository:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def fetch_batch_weak_signal_rows(self, batch_id: str) -> List[Dict]:
+        status_expr = "UPPER(COALESCE(onuStatusStr, ''))"
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    "Cổng" AS subscriber_key,
+                    "Cổng" AS port_id,
+                    batch_id,
+                    oltPowerRx,
+                    onuPowerRx,
+                    onuStatusStr,
+                    accountFiber,
+                    NgayDo,
+                    ThoiGianDo
+                FROM onu_measurements
+                WHERE batch_id = ?
+                  AND {status_expr} LIKE '%ON%'
+                  AND {status_expr} NOT LIKE '%OFF%'
+                  AND (
+                    (oltPowerRx IS NOT NULL AND oltPowerRx <= -27 AND oltPowerRx > -40)
+                    OR
+                    (onuPowerRx IS NOT NULL AND onuPowerRx <= -27 AND onuPowerRx > -40)
+                  )
+                ORDER BY NgayDo, ThoiGianDo, subscriber_key
+                """,
+                (batch_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def fetch_metadata_map(self, subscriber_keys: Sequence[str]) -> Dict[str, Dict]:
         if not subscriber_keys:
             return {}

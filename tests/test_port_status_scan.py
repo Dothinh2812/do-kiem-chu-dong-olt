@@ -12,9 +12,47 @@ except ModuleNotFoundError:
     import app
 
 
+class FakeLocator:
+    def __init__(self, selector, visible_selectors, calls):
+        self.selector = selector
+        self.visible_selectors = visible_selectors
+        self.calls = calls
+
+    def wait_for(self, state=None, timeout=None):
+        self.calls.append((self.selector, state, timeout))
+        if self.selector not in self.visible_selectors:
+            raise TimeoutError(self.selector)
+
+
+class FakePage:
+    def __init__(self, visible_selectors):
+        self.visible_selectors = set(visible_selectors)
+        self.calls = []
+
+    def locator(self, selector):
+        return FakeLocator(selector, self.visible_selectors, self.calls)
+
+
 def read_csv_rows(path):
     with path.open("r", encoding="utf-8", newline="") as file_obj:
         return list(csv.DictReader(file_obj))
+
+
+def test_first_visible_locator_uses_shorter_timeout_for_fallback_selectors():
+    page = FakePage(visible_selectors={"#passOTP"})
+
+    locator = app._first_visible_locator(page, ("missing-selector", "#passOTP"))
+
+    assert locator.selector == "#passOTP"
+    assert page.calls == [
+        ("missing-selector", "visible", 30000),
+        ("#passOTP", "visible", 5000),
+    ]
+
+
+def test_otp_confirm_button_prefers_new_cts_selector():
+    assert app.OTP_CONFIRM_BUTTON_SELECTORS[0] == '//*[@id="loginForm"]/section/button'
+    assert '//*[@id="loginForm"]/div[1]/button' in app.OTP_CONFIRM_BUTTON_SELECTORS
 
 
 def test_build_port_status_slot_tasks_deduplicates_frame_slot():

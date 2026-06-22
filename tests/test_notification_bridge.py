@@ -1063,6 +1063,115 @@ def test_dispatch_batch_notifications_filters_current_off_rows_by_today_cutoff(r
     assert any("group outage cutoff=" in message and "filtered_by_cutoff=1" in message for message in messages)
 
 
+def test_dispatch_batch_notifications_sends_daily_personal_weak_signal_on_rows(repo_paths, monkeypatch):
+    repo, measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    with sqlite3.connect(measurement_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO onu_measurements (
+                "Cổng", batch_id, oltPowerRx, onuPowerRx, onuStatusStr,
+                accountFiber, NgayDo, ThoiGianDo
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("sub-weak-olt", "b1", -27.5, -24.0, "ON", "TB001", "2026-04-24", "12:30:00"),
+                ("sub-weak-onu", "b1", -25.0, -28.0, "ON", "TB002", "2026-04-24", "12:30:00"),
+                ("sub-off", "b1", -28.0, -28.0, "OFF", "TB003", "2026-04-24", "12:30:00"),
+                ("sub-too-low", "b1", -41.0, -24.0, "ON", "TB004", "2026-04-24", "12:30:00"),
+                ("sub-normal", "b1", -26.9, -26.9, "ON", "TB005", "2026-04-24", "12:30:00"),
+            ],
+        )
+        conn.commit()
+
+    with sqlite3.connect(repo.source_db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO danhba (
+                sub, Ma_Tb, Ma_Men, Ten_Tb, DIACHI_LD, DIENTHOAI_LH, TEN_NVKT_DB, DOI_VT
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("sub-weak-olt", "TB001", "", "Ten TB 1", "Dia chi 1", "0901", "VNPT - Nguyen Van A", "Doi VT"),
+                ("sub-weak-onu", "TB002", "", "Ten TB 2", "Dia chi 2", "0902", "VNPT - Nguyen Van A", "Doi VT"),
+                ("sub-off", "TB003", "", "Ten TB 3", "Dia chi 3", "0903", "VNPT - Nguyen Van A", "Doi VT"),
+                ("sub-too-low", "TB004", "", "Ten TB 4", "Dia chi 4", "0904", "VNPT - Nguyen Van A", "Doi VT"),
+                ("sub-normal", "TB005", "", "Ten TB 5", "Dia chi 5", "0905", "VNPT - Nguyen Van A", "Doi VT"),
+            ],
+        )
+        conn.commit()
+
+    monkeypatch.setattr(notification_bridge, "load_current_off_snapshot_rows", lambda repo, batch_id: [])
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": True,
+            "enable_individual_alert_notifications": True,
+            "individual_alert_time_window": "06:00-21:00",
+            "individual_alert_send_every_batches": 1,
+        },
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "get_zalo_user_by_nvkt",
+        lambda nvkt, config=None: "user-a",
+    )
+    weak_signal_day = {"value": "2026-04-24"}
+    monkeypatch.setattr(
+        notification_bridge,
+        "build_weak_signal_sent_state_key",
+        lambda config=None, now=None: f"weak_signal_individual_sent_subscribers:{weak_signal_day['value']}",
+    )
+
+    sent_messages = []
+
+    async def fake_send_zalo_message_to_user_detailed(message, user_id, client=None):
+        sent_messages.append((user_id, message))
+        return {
+            "success": True,
+            "thread_id": user_id,
+            "message": message,
+            "stdout": "ok",
+            "stderr": "",
+            "returncode": 0,
+            "command": [],
+        }
+
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "send_zalo_message_to_user_detailed",
+        fake_send_zalo_message_to_user_detailed,
+    )
+
+    first_result = dispatch_batch_notifications(repo, "b1", log=lambda _message: None)
+    second_result = dispatch_batch_notifications(repo, "b1", log=lambda _message: None)
+    weak_signal_day["value"] = "2026-04-25"
+    third_result = dispatch_batch_notifications(repo, "b1", log=lambda _message: None)
+
+    assert first_result["personal_weak_signal"]["raw_pending_alerts"] == 2
+    assert first_result["personal_weak_signal"]["filtered_pending_alerts"] == 2
+    assert first_result["personal_weak_signal"]["marked_sent_alerts"] == 2
+    assert second_result["personal_weak_signal"]["filtered_pending_alerts"] == 0
+    assert third_result["personal_weak_signal"]["filtered_pending_alerts"] == 2
+    assert third_result["personal_weak_signal"]["marked_sent_alerts"] == 2
+    assert len(sent_messages) == 2
+    assert "Suy hao cao" in sent_messages[0][1]
+    assert "TB001" in sent_messages[0][1]
+    assert "TB002" in sent_messages[0][1]
+    assert "TB003" not in sent_messages[0][1]
+    assert "TB004" not in sent_messages[0][1]
+    assert "TB005" not in sent_messages[0][1]
+
+
 def test_dispatch_batch_notifications_excludes_suppressed_current_off_rows(repo_paths, monkeypatch):
     repo, _measurement_db = repo_paths
 

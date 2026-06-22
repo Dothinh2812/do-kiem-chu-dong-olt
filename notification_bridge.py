@@ -64,6 +64,11 @@ def build_individual_alert_sent_state_key(config: Dict = None, now: datetime = N
     return f"individual_alert_sent_subscribers:{day}:{start_label}"
 
 
+def build_weak_signal_sent_state_key(config: Dict = None, now: datetime = None) -> str:
+    current = now or datetime.now()
+    return f"weak_signal_individual_sent_subscribers:{current.date().isoformat()}"
+
+
 def filter_unsent_individual_alert_rows(repo: AlertRepository, rows: List[Dict], state_key: str) -> List[Dict]:
     sent_identities = _load_sent_subscriber_identities(repo, state_key)
     return [row for row in rows if _subscriber_identity(row) and _subscriber_identity(row) not in sent_identities]
@@ -136,6 +141,89 @@ async def send_personal_current_off_alerts(alerts: List[Dict], batch_id: str, co
     return results
 
 
+def load_weak_signal_rows(repo: AlertRepository, batch_id: str) -> List[Dict]:
+    raw_rows = repo.fetch_batch_weak_signal_rows(batch_id)
+    metadata_map = repo.fetch_metadata_map([row["subscriber_key"] for row in raw_rows])
+    rows = []
+    for row in raw_rows:
+        metadata = metadata_map.get(row["subscriber_key"], {})
+        ma_tb = (metadata.get("Ma_Tb") or "").strip() or (row.get("accountFiber") or "").strip()
+        rows.append(
+            {
+                **row,
+                "ma_tb": ma_tb,
+                "ten_tb": (metadata.get("Ten_Tb") or "").strip(),
+                "ma_men": (metadata.get("Ma_Men") or "").strip(),
+                "doi_vt": (metadata.get("DOI_VT") or "").strip(),
+                "diachi_ld": (metadata.get("DIACHI_LD") or "").strip(),
+                "dienthoai_lh": (metadata.get("DIENTHOAI_LH") or "").strip(),
+                "ten_nvkt_db": (metadata.get("TEN_NVKT_DB") or "").strip(),
+            }
+        )
+    return rows
+
+
+async def send_personal_weak_signal_alerts(alerts: List[Dict], batch_id: str, config: Dict) -> Dict:
+    results = {"sent": 0, "failed": 0, "no_user": 0, "deliveries": [], "sent_rows": []}
+    groups = defaultdict(list)
+    for alert in alerts:
+        nvkt = notification_service._short_nvkt(alert.get("ten_nvkt_db", "") or "")
+        groups[nvkt or "Chưa gán NVKT"].append(alert)
+
+    for nvkt, items in groups.items():
+        user_id = notification_service.get_zalo_user_by_nvkt(nvkt, config=config)
+        message = notification_service.format_weak_signal_by_nvkt(items, for_zalo=True)
+        if not user_id:
+            results["no_user"] += 1
+            results["deliveries"].append(
+                {
+                    "batch_id": batch_id,
+                    "channel": "zalo",
+                    "alert_type": "personal_weak_signal",
+                    "target_id": "",
+                    "nvkt": nvkt,
+                    "status": "NO_USER",
+                    "message_full": message,
+                    "alert_ids": [],
+                    "alert_count": len(items),
+                    "error": "NVKT not mapped",
+                    "stdout": "",
+                    "stderr": "",
+                    "returncode": None,
+                    "command": [],
+                }
+            )
+            continue
+
+        delivery_result = await notification_service.send_zalo_message_to_user_detailed(message, user_id)
+        success = delivery_result.get("success", False)
+        if success:
+            results["sent"] += 1
+            results["sent_rows"].extend(items)
+        else:
+            results["failed"] += 1
+        results["deliveries"].append(
+            {
+                "batch_id": batch_id,
+                "channel": "zalo",
+                "alert_type": "personal_weak_signal",
+                "target_id": user_id,
+                "nvkt": nvkt,
+                "status": "SUCCESS" if success else "FAILED",
+                "message_full": message,
+                "alert_ids": [],
+                "alert_count": len(items),
+                "error": delivery_result.get("error", ""),
+                "stdout": delivery_result.get("stdout", ""),
+                "stderr": delivery_result.get("stderr", ""),
+                "returncode": delivery_result.get("returncode"),
+                "command": delivery_result.get("command", []),
+            }
+        )
+
+    return results
+
+
 async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     results = {
         "wide_area": {
@@ -159,6 +247,15 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             "no_thread_groups": 0,
         },
         "personal_outage": {
+            "raw_pending_alerts": 0,
+            "filtered_pending_alerts": 0,
+            "filtered_out_alerts": 0,
+            "marked_sent_alerts": 0,
+            "zalo_messages_sent": 0,
+            "zalo_messages_failed": 0,
+            "no_user": 0,
+        },
+        "personal_weak_signal": {
             "raw_pending_alerts": 0,
             "filtered_pending_alerts": 0,
             "filtered_out_alerts": 0,
@@ -485,6 +582,51 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             f"zalo_sent={personal_results.get('sent', 0)} "
             f"failed={personal_results.get('failed', 0)} "
             f"no_user={personal_results.get('no_user', 0)}",
+        )
+
+    weak_signal_policy = notification_service.get_alert_policy_status("outage", config)
+    raw_weak_signal_alerts = load_weak_signal_rows(repo, batch_id)
+    weak_signal_state_key = build_weak_signal_sent_state_key(config=config)
+    weak_signal_unsent_alerts = (
+        filter_unsent_individual_alert_rows(repo, raw_weak_signal_alerts, weak_signal_state_key)
+        if weak_signal_policy["allowed"]
+        else []
+    )
+    results["personal_weak_signal"]["raw_pending_alerts"] = len(raw_weak_signal_alerts)
+    results["personal_weak_signal"]["filtered_pending_alerts"] = len(weak_signal_unsent_alerts)
+    results["personal_weak_signal"]["filtered_out_alerts"] = len(raw_weak_signal_alerts) - len(weak_signal_unsent_alerts)
+    if raw_weak_signal_alerts and not weak_signal_policy["allowed"]:
+        _emit(log, f"[NOTIFY] Batch {batch_id}: weak signal {weak_signal_policy['message']}")
+    if weak_signal_unsent_alerts:
+        weak_signal_results = {"sent": 0, "failed": 0, "no_user": 0, "deliveries": [], "sent_rows": []}
+        if config.get("enable_zalo", True):
+            weak_signal_results = await send_personal_weak_signal_alerts(
+                weak_signal_unsent_alerts,
+                batch_id,
+                config,
+            )
+            for delivery in weak_signal_results.get("deliveries", []):
+                notification_service.append_notification_delivery_log(delivery)
+        elif not config.get("enable_telegram", True):
+            weak_signal_results["sent_rows"] = list(weak_signal_unsent_alerts)
+        rows_to_mark_sent = weak_signal_results.get("sent_rows", [])
+        if rows_to_mark_sent:
+            mark_individual_alert_rows_sent(repo, rows_to_mark_sent, weak_signal_state_key)
+        results["personal_weak_signal"].update(
+            {
+                "marked_sent_alerts": len(rows_to_mark_sent),
+                "zalo_messages_sent": weak_signal_results.get("sent", 0),
+                "zalo_messages_failed": weak_signal_results.get("failed", 0),
+                "no_user": weak_signal_results.get("no_user", 0),
+            }
+        )
+        _emit(
+            log,
+            "[NOTIFY] Batch "
+            f"{batch_id}: personal weak signal sent={results['personal_weak_signal']['marked_sent_alerts']} "
+            f"zalo_sent={weak_signal_results.get('sent', 0)} "
+            f"failed={weak_signal_results.get('failed', 0)} "
+            f"no_user={weak_signal_results.get('no_user', 0)}",
         )
 
     recovery_alerts = repo.list_unsent_recovery_alerts(batch_id)

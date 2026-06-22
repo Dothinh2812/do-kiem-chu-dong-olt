@@ -10,6 +10,40 @@ except ImportError:
     from config import Config
 
 
+OTP_FIELD_SELECTORS = (
+    '//*[@id="passOTP"]',
+    "#passOTP",
+)
+
+OTP_CONFIRM_BUTTON_SELECTORS = (
+    '//*[@id="loginForm"]/section/button',
+    '//*[@id="loginForm"]/div[1]/button',
+    '#loginForm button[type="submit"]',
+    '#loginForm button',
+    'button[type="submit"]',
+)
+
+
+def _first_visible_locator(page, selectors, first_timeout=30000, fallback_timeout=5000):
+    last_error = None
+    for index, selector in enumerate(selectors):
+        locator = page.locator(selector)
+        try:
+            timeout = first_timeout if index == 0 else fallback_timeout
+            locator.wait_for(state="visible", timeout=timeout)
+            return locator
+        except Exception as exc:
+            last_error = exc
+
+    raise last_error
+
+
+def _click_first_visible_button(page, selectors):
+    button = _first_visible_locator(page, selectors)
+    button.click()
+    return button
+
+
 def read_otp_from_file():
     """
     Đọc mã OTP từ file (đường dẫn cấu hình trong .env)
@@ -93,29 +127,32 @@ def login_baocao_hanoi():
 
     # Bước 2: Điền username
     print(f"Đang điền username: {Config.BAOCAO_USERNAME}")
-    username_field = page_baocao.locator('//*[@id="username"]')
-    username_field.wait_for(state="visible", timeout=30000)
+    username_field = _first_visible_locator(page_baocao, ('//*[@id="username"]', "#username"))
     username_field.fill(Config.BAOCAO_USERNAME)
     time.sleep(1)
 
     # Bước 3: Điền password
     print("Đang điền password...")
-    password_field = page_baocao.locator('//*[@id="password"]')
-    password_field.wait_for(state="visible", timeout=30000)
+    password_field = _first_visible_locator(page_baocao, ('//*[@id="password"]', "#password"))
     password_field.fill(Config.BAOCAO_PASSWORD)
     time.sleep(1)
 
     # Bước 4: Click button Đăng nhập
     print("Đang click button Đăng nhập...")
-    login_button = page_baocao.locator('//*[@id="fm1"]/section/button')
-    login_button.wait_for(state="visible", timeout=30000)
-    login_button.click()
+    _click_first_visible_button(
+        page_baocao,
+        (
+            '//*[@id="fm1"]/section/button',
+            '#fm1 button[type="submit"]',
+            '#fm1 button',
+            'button[type="submit"]',
+        ),
+    )
     time.sleep(3)
 
     # Bước 5: Đợi trường input OTP xuất hiện
     print("Đang đợi trường nhập OTP...")
-    otp_field = page_baocao.locator('//*[@id="passOTP"]')
-    otp_field.wait_for(state="visible", timeout=30000)
+    otp_field = _first_visible_locator(page_baocao, OTP_FIELD_SELECTORS)
 
     # Bước 6: Đọc OTP từ file
     otp_code = read_otp_from_file()
@@ -134,9 +171,7 @@ def login_baocao_hanoi():
 
         # Bước 8: Click button xác nhận OTP
         print("Đang click button xác nhận OTP...")
-        otp_confirm_button = page_baocao.locator('//*[@id="loginForm"]/div[1]/button')
-        otp_confirm_button.wait_for(state="visible", timeout=30000)
-        otp_confirm_button.click()
+        _click_first_visible_button(page_baocao, OTP_CONFIRM_BUTTON_SELECTORS)
         time.sleep(5)
 
     # Bước 9: Kiểm tra đăng nhập thành công
