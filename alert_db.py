@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 try:
     from .alert_models import OutageAlert, RecoveryAlert, WideAreaAlert
@@ -224,6 +224,27 @@ class AlertRepository:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customer_outage_alert_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subscriber_key TEXT NOT NULL,
+                    ma_tb TEXT NOT NULL,
+                    first_off_time TEXT NOT NULL,
+                    sent_time DATETIME NOT NULL,
+                    batch_id TEXT,
+                    request_id TEXT UNIQUE NOT NULL,
+                    status TEXT NOT NULL,
+                    error_reason TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cust_outage_sub_key ON customer_outage_alert_log(subscriber_key, sent_time)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cust_outage_sub_first_off ON customer_outage_alert_log(subscriber_key, first_off_time)"
+            )
             conn.commit()
 
     def get_batch_status(self, batch_id: str) -> Optional[str]:
@@ -327,7 +348,7 @@ class AlertRepository:
             rows = conn.execute(
                 """
                 SELECT "Cổng" AS subscriber_key, batch_id, onuLastOff, onuLastOn, onuStatusStr, accountFiber,
-                       NgayDo, ThoiGianDo
+                       oltPowerRx, onuPowerRx, NgayDo, ThoiGianDo
                 FROM onu_measurements
                 WHERE batch_id = ?
                 ORDER BY subscriber_key
@@ -1024,3 +1045,67 @@ class AlertRepository:
             notification_sent=bool(row["notification_sent"]),
             notification_time=_dt(row["notification_time"]),
         )
+
+    def log_customer_outage_alert(
+        self,
+        subscriber_key: str,
+        ma_tb: str,
+        first_off_time: Union[str, datetime],
+        sent_time: datetime,
+        batch_id: Optional[str],
+        request_id: str,
+        status: str,
+        error_reason: Optional[str] = None,
+    ) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO customer_outage_alert_log(
+                    subscriber_key, ma_tb, first_off_time, sent_time, batch_id, request_id, status, error_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(request_id) DO UPDATE SET
+                    status = excluded.status,
+                    sent_time = excluded.sent_time,
+                    error_reason = excluded.error_reason
+                """,
+                (
+                    subscriber_key,
+                    ma_tb,
+                    _iso(first_off_time),
+                    _iso(sent_time),
+                    batch_id,
+                    request_id,
+                    status,
+                    error_reason,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def has_customer_outage_alert_sent(
+        self, subscriber_key: str, first_off_time: Union[str, datetime]
+    ) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM customer_outage_alert_log
+                WHERE subscriber_key = ? AND first_off_time = ? AND status = 'SENT'
+                LIMIT 1
+                """,
+                (subscriber_key, _iso(first_off_time)),
+            ).fetchone()
+            return bool(row)
+
+    def count_recent_customer_outage_alerts(
+        self, subscriber_key: str, since: datetime
+    ) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) as cnt FROM customer_outage_alert_log
+                WHERE subscriber_key = ? AND sent_time >= ? AND status = 'SENT'
+                """,
+                (subscriber_key, _iso(since)),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+

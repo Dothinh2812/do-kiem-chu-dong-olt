@@ -296,7 +296,7 @@ def test_dispatch_batch_notifications_logs_zalo_error_details_for_wide_area(repo
             "stdout": "stdout details",
             "stderr": "stderr details",
             "returncode": 17,
-            "command": ["/node", "/openzca", "--profile", "zalo2", "msg", "send", thread_id],
+            "command": ["/node", "/openzca", "--profile", "TTVTST", "msg", "send", thread_id],
         }
 
     monkeypatch.setattr(
@@ -314,13 +314,13 @@ def test_dispatch_batch_notifications_logs_zalo_error_details_for_wide_area(repo
     assert payload["channel"] == "zalo"
     assert payload["alert_type"] == "wide_area"
     assert payload["status"] == "FAILED"
-    assert payload["target_id"] == "7968537750365285360"
+    assert payload["target_id"] == "860736048191000245"
     assert payload["alert_ids"] == [inserted_id]
     assert payload["error"] == "group not found"
     assert payload["stdout"] == "stdout details"
     assert payload["stderr"] == "stderr details"
     assert payload["returncode"] == 17
-    assert payload["command"] == ["/node", "/openzca", "--profile", "zalo2", "msg", "send", "7968537750365285360"]
+    assert payload["command"] == ["/node", "/openzca", "--profile", "TTVTST", "msg", "send", "860736048191000245"]
 
 
 def test_dispatch_batch_notifications_wide_area_message_includes_start_time_and_duration(repo_paths, monkeypatch):
@@ -733,8 +733,8 @@ def test_dispatch_batch_notifications_keeps_personal_alerts_when_group_disabled(
             "enable_individual_alert_notifications": True,
             "group_alert_send_every_batches": 1,
             "individual_alert_send_every_batches": 1,
-            "group_alert_start_time": "06:00",
-            "individual_alert_start_time": "06:00",
+            "group_alert_start_time": "",
+            "individual_alert_start_time": "",
         },
     )
     monkeypatch.setattr(
@@ -813,8 +813,8 @@ def test_dispatch_batch_notifications_uses_independent_group_and_personal_cycles
             "enable_individual_alert_notifications": True,
             "group_alert_send_every_batches": 2,
             "individual_alert_send_every_batches": 3,
-            "group_alert_start_time": "06:00",
-            "individual_alert_start_time": "06:00",
+            "group_alert_start_time": "",
+            "individual_alert_start_time": "",
         },
     )
 
@@ -1229,6 +1229,66 @@ def test_dispatch_batch_notifications_excludes_suppressed_current_off_rows(repo_
     assert result["outage"]["marked_sent_alerts"] == 1
 
 
+def test_individual_off_alert_gate_enforce_keeps_only_eligible_rows():
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    rows = [
+        {"subscriber_key": "eligible", "alert_eligible": True},
+        {"subscriber_key": "blocked", "alert_eligible": False},
+        {"subscriber_key": "legacy-without-decision"},
+    ]
+
+    assert notification_bridge.filter_individual_off_alert_gate_rows(rows, "enforce") == [rows[0]]
+    assert notification_bridge.filter_individual_off_alert_gate_rows(rows, "shadow") == rows
+    assert notification_bridge.filter_individual_off_alert_gate_rows(rows, "off") == rows
+
+
+def test_individual_off_alert_gate_shadow_reports_decision_counts(repo_paths, monkeypatch):
+    repo, _measurement_db = repo_paths
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    rows = [
+        {
+            "subscriber_key": "eligible",
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+            "alert_eligible": True,
+        },
+        {
+            "subscriber_key": "blocked",
+            "suppressed_by_pattern": False,
+            "suppressed_by_wide_area": False,
+            "alert_eligible": False,
+        },
+    ]
+    monkeypatch.setattr(notification_bridge, "load_current_off_snapshot_rows", lambda *_args: rows)
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+            "enable_group_alert_notifications": False,
+            "enable_individual_alert_notifications": False,
+            "individual_off_alert_gate_mode": "shadow",
+        },
+    )
+
+    messages = []
+    result = dispatch_batch_notifications(repo, "b1", log=messages.append)
+
+    assert result["outage"]["gate_eligible"] == 1
+    assert result["outage"]["gate_blocked"] == 1
+    assert any("decision_eligible=1 decision_blocked=1 dispatch_candidates=2" in message for message in messages)
+
+
 def test_dispatch_batch_notifications_skips_wide_area_alerts_outside_time_window(repo_paths, monkeypatch):
     repo, _measurement_db = repo_paths
 
@@ -1451,3 +1511,87 @@ def test_dispatch_batch_notifications_does_not_mark_outage_events_sent_for_recur
     with sqlite3.connect(measurement_db) as conn:
         sent = conn.execute("SELECT notification_sent FROM outage_alerts WHERE id = ?", (inserted_id,)).fetchone()[0]
     assert sent == 0
+
+
+def test_dispatch_batch_notifications_customer_outage(tmp_path, monkeypatch):
+    measurement_db = tmp_path / "onu_measurements.db"
+    source_db = tmp_path / "database.db"
+
+    with sqlite3.connect(measurement_db) as conn:
+        conn.executescript(RAW_SCHEMA)
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE danhba (
+                sub TEXT,
+                Ma_Tb TEXT,
+                Ma_Men TEXT,
+                Ten_Tb TEXT,
+                DIACHI_LD TEXT,
+                DIENTHOAI_LH TEXT,
+                TEN_NVKT_DB TEXT,
+                DOI_VT TEXT
+            )
+            """
+        )
+
+    repo = AlertRepository(str(measurement_db), str(source_db))
+    repo.ensure_schema()
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    snapshot_row = {
+        "subscriber_key": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
+        "ma_tb": "TB001",
+        "ten_tb": "Nguyen Van A",
+        "diachi_ld": "Dia chi 1",
+        "ten_nvkt_db": "NVKT 1",
+        "first_off_time": "2026-09-11T10:00:00",
+        "duration_minutes": 60,
+        "suppressed_by_pattern": False,
+        "suppressed_by_wide_area": False,
+        "alert_eligible": True,
+    }
+
+    monkeypatch.setattr(
+        notification_bridge,
+        "load_current_off_snapshot_rows",
+        lambda repo, batch_id: [snapshot_row],
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+            "enable_customer_outage_alert": True,
+            "customer_alert_time_window": "00:00-23:59",
+            "telecom_zalo_api_url": "http://localhost:3002",
+            "telecom_zalo_api_key": "key",
+        },
+    )
+
+    async def fake_process(*args, **kwargs):
+        return {
+            "pending": 1,
+            "eligible": 1,
+            "sent": 1,
+            "failed": 0,
+            "skipped": 0,
+            "skipped_reasons": {},
+        }
+
+    monkeypatch.setattr(
+        notification_bridge.customer_notification_service,
+        "process_customer_outage_alerts",
+        fake_process,
+    )
+
+    results = dispatch_batch_notifications(repo, "b1", log=lambda _message: None)
+    assert "customer_outage" in results
+    assert results["customer_outage"]["sent"] == 1
+    assert results["customer_outage"]["eligible"] == 1
+

@@ -23,9 +23,12 @@ except ImportError:
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config_notification.json")
 OLT_MAPPING_FILE = os.path.join(os.path.dirname(__file__), "olt_mapping.xlsx")
 DEFAULT_INDIVIDUAL_ZALO_MAPPING_FILE = os.path.join(os.path.dirname(__file__), "individual_zalo_mapping.json")
-DEFAULT_OPENZCA_PROFILE = os.environ.get("OPENZCA_PROFILE", "zalo2")
+DEFAULT_OPENZCA_PROFILE = os.environ.get("OPENZCA_PROFILE", "TTVTST")
 NOTIFICATION_DELIVERY_LOG_FILE = os.path.join("log_message", "notification_delivery.jsonl")
 _OLT_DISPLAY_NAME_CACHE = None
+INDIVIDUAL_OFF_ALERT_GATE_MODES = {"off", "shadow", "enforce"}
+DEFAULT_INDIVIDUAL_OFF_ALERT_GATE_MODE = "enforce"
+DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES = 60
 
 load_dotenv()
 
@@ -81,9 +84,27 @@ def _build_default_config() -> Dict:
             _env_int("INDIVIDUAL_ALERT_SEND_EVERY_BATCHES", 1),
         ),
         "individual_alert_send_every_batches": _env_int("INDIVIDUAL_ALERT_SEND_EVERY_BATCHES", 1),
+        "individual_off_alert_gate_mode": _env_str(
+            "INDIVIDUAL_OFF_ALERT_GATE_MODE",
+            DEFAULT_INDIVIDUAL_OFF_ALERT_GATE_MODE,
+        ),
+        "individual_off_min_duration_minutes": _env_int(
+            "INDIVIDUAL_OFF_MIN_DURATION_MINUTES",
+            DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES,
+        ),
         "individual_zalo_mapping_file": _env_str(
             "INDIVIDUAL_ZALO_MAPPING_FILE",
             DEFAULT_INDIVIDUAL_ZALO_MAPPING_FILE,
+        ),
+        "enable_customer_outage_alert": _env_bool("ENABLE_CUSTOMER_OUTAGE_ALERT", False),
+        "customer_alert_time_window": _env_str("CUSTOMER_ALERT_TIME_WINDOW", "07:00-21:00"),
+        "customer_alert_hotline": _env_str("CUSTOMER_ALERT_HOTLINE", "0822036382"),
+        "telecom_zalo_api_url": _env_str("TELECOM_ZALO_API_URL", "http://localhost:3002"),
+        "telecom_zalo_api_key": _env_str("TELECOM_ZALO_API_KEY", ""),
+        "customer_alert_max_per_day": _env_int("CUSTOMER_ALERT_MAX_PER_DAY", 1),
+        "customer_alert_max_per_week": _env_int("CUSTOMER_ALERT_MAX_PER_WEEK", 3),
+        "customer_alert_send_timeout_seconds": float(
+            os.environ.get("CUSTOMER_ALERT_SEND_TIMEOUT_SECONDS", "3.0")
         ),
     }
 
@@ -98,6 +119,11 @@ _ALERT_POLICY_CONFIG = {
         "enabled_key": "enable_individual_alert_notifications",
         "window_key": "individual_alert_time_window",
         "label": "individual outage",
+    },
+    "customer_outage": {
+        "enabled_key": "enable_customer_outage_alert",
+        "window_key": "customer_alert_time_window",
+        "label": "customer outage",
     },
     "wide_area": {
         "enabled_key": "enable_wide_area_alert_notifications",
@@ -122,7 +148,59 @@ def load_config() -> Dict:
                 config.update(json.load(handle))
         except Exception as exc:
             print(f"⚠️ Could not load {CONFIG_FILE}: {exc}")
+    _normalize_individual_off_alert_gate_config(config, warn=True)
     return config
+
+
+def _normalize_individual_off_alert_gate_config(config: Dict, *, warn: bool = False) -> None:
+    raw_mode = config.get("individual_off_alert_gate_mode")
+    mode = str(raw_mode or "").strip().lower()
+    if mode not in INDIVIDUAL_OFF_ALERT_GATE_MODES:
+        if warn:
+            print(
+                "⚠️ Invalid INDIVIDUAL_OFF_ALERT_GATE_MODE; "
+                f"using {DEFAULT_INDIVIDUAL_OFF_ALERT_GATE_MODE}"
+            )
+        config["individual_off_alert_gate_mode"] = DEFAULT_INDIVIDUAL_OFF_ALERT_GATE_MODE
+    else:
+        config["individual_off_alert_gate_mode"] = mode
+
+    raw_duration = config.get("individual_off_min_duration_minutes")
+    try:
+        duration = int(raw_duration)
+    except (TypeError, ValueError):
+        duration = 0
+    if duration <= 0:
+        if warn:
+            print(
+                "⚠️ Invalid INDIVIDUAL_OFF_MIN_DURATION_MINUTES; "
+                f"using {DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES}"
+            )
+        duration = DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES
+    config["individual_off_min_duration_minutes"] = duration
+
+
+def get_individual_off_alert_gate_mode(config: Optional[Dict] = None) -> str:
+    active_config = load_config() if config is None else config
+    raw_mode = active_config.get("individual_off_alert_gate_mode")
+    if raw_mode is None:
+        # Partial dictionaries used by existing callers/tests predate this gate.
+        return "off"
+    mode = str(raw_mode or "").strip().lower()
+    return mode if mode in INDIVIDUAL_OFF_ALERT_GATE_MODES else DEFAULT_INDIVIDUAL_OFF_ALERT_GATE_MODE
+
+
+def get_individual_off_min_duration_minutes(config: Optional[Dict] = None) -> int:
+    active_config = load_config() if config is None else config
+    raw_value = active_config.get(
+        "individual_off_min_duration_minutes",
+        DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES,
+    )
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES
+    return value if value > 0 else DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES
 
 
 def _parse_hhmm(value: str) -> dt_time:

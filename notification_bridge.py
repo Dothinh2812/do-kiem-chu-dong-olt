@@ -8,10 +8,12 @@ from typing import Dict, List
 try:
     from .alert_db import AlertRepository
     from . import notification_service
+    from . import customer_notification_service
     from .current_off_snapshot import get_snapshot_output_path, load_snapshot_rows_for_batch
 except ImportError:
     from alert_db import AlertRepository
     import notification_service
+    import customer_notification_service
     from current_off_snapshot import get_snapshot_output_path, load_snapshot_rows_for_batch
 
 def _emit(log, message: str):
@@ -30,6 +32,12 @@ def filter_active_current_off_snapshot_rows(rows: List[Dict]) -> List[Dict]:
         for row in rows
         if not row.get("suppressed_by_pattern") and not row.get("suppressed_by_wide_area")
     ]
+
+
+def filter_individual_off_alert_gate_rows(rows: List[Dict], mode: str) -> List[Dict]:
+    if mode in {"off", "shadow"}:
+        return list(rows)
+    return [row for row in rows if row.get("alert_eligible") is True]
 
 
 def _subscriber_identity(row: Dict) -> str:
@@ -245,6 +253,8 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             "zalo_groups_sent": 0,
             "zalo_groups_failed": 0,
             "no_thread_groups": 0,
+            "gate_eligible": 0,
+            "gate_blocked": 0,
         },
         "personal_outage": {
             "raw_pending_alerts": 0,
@@ -271,6 +281,14 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             "zalo_messages_sent": 0,
             "zalo_messages_failed": 0,
             "no_thread": 0,
+        },
+        "customer_outage": {
+            "pending": 0,
+            "eligible": 0,
+            "sent": 0,
+            "failed": 0,
+            "skipped": 0,
+            "skipped_reasons": {},
         },
     }
     config = notification_service.load_config()
@@ -421,13 +439,29 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
 
     raw_outage_alerts = load_current_off_snapshot_rows(repo, batch_id)
     active_outage_alerts = filter_active_current_off_snapshot_rows(raw_outage_alerts)
+    alert_gate_mode = notification_service.get_individual_off_alert_gate_mode(config)
+    decision_eligible_count = sum(
+        1 for row in active_outage_alerts if row.get("alert_eligible") is True
+    )
+    decision_blocked_count = len(active_outage_alerts) - decision_eligible_count
+    gated_outage_alerts = filter_individual_off_alert_gate_rows(
+        active_outage_alerts,
+        alert_gate_mode,
+    )
+    _emit(
+        log,
+        f"[NOTIFY] Batch {batch_id}: individual OFF gate mode={alert_gate_mode} "
+        f"active={len(active_outage_alerts)} decision_eligible={decision_eligible_count} "
+        f"decision_blocked={decision_blocked_count} "
+        f"dispatch_candidates={len(gated_outage_alerts)}",
+    )
     group_policy = notification_service.get_alert_policy_status("group_outage", config)
     outage_cycle = repo.advance_notification_cycle("group_alert", batch_id)
     outage_interval = notification_service.get_group_alert_send_every_batches(config)
     cycle_allows_send = outage_cycle % outage_interval == 0
     cutoff_filtered_outage_alerts = (
         notification_service.filter_current_off_alerts_by_cutoff(
-            active_outage_alerts,
+            gated_outage_alerts,
             config=config,
             start_time_key="group_alert_start_time",
         )
@@ -436,6 +470,8 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     )
     outage_alerts = cutoff_filtered_outage_alerts if group_policy["allowed"] and cycle_allows_send else []
     results["outage"]["raw_pending_alerts"] = len(raw_outage_alerts)
+    results["outage"]["gate_eligible"] = decision_eligible_count
+    results["outage"]["gate_blocked"] = decision_blocked_count
     results["outage"]["filtered_pending_alerts"] = len(outage_alerts)
     results["outage"]["filtered_out_alerts"] = len(raw_outage_alerts) - len(outage_alerts)
     cutoff = notification_service.get_current_off_alert_cutoff(config, start_time_key="group_alert_start_time")
@@ -444,7 +480,7 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             log,
             "[NOTIFY] Batch "
             f"{batch_id}: group outage cutoff={cutoff} "
-            f"filtered_by_cutoff={len(active_outage_alerts) - len(outage_alerts)}",
+            f"filtered_by_cutoff={len(gated_outage_alerts) - len(outage_alerts)}",
         )
     if raw_outage_alerts and not group_policy["allowed"]:
         _emit(log, f"[NOTIFY] Batch {batch_id}: {group_policy['message']}")
@@ -524,7 +560,7 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
     personal_cycle_allows_send = personal_cycle % personal_interval == 0
     personal_cutoff_filtered_alerts = (
         notification_service.filter_current_off_alerts_by_cutoff(
-            active_outage_alerts,
+            gated_outage_alerts,
             config=config,
             start_time_key="individual_alert_start_time",
         )
@@ -583,6 +619,37 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             f"failed={personal_results.get('failed', 0)} "
             f"no_user={personal_results.get('no_user', 0)}",
         )
+
+    if config.get("enable_customer_outage_alert", False):
+        customer_policy = notification_service.get_alert_policy_status("customer_outage", config)
+        if not customer_policy["allowed"]:
+            _emit(log, f"[NOTIFY] Batch {batch_id}: {customer_policy['message']}")
+            results["customer_outage"]["pending"] = len(gated_outage_alerts)
+            results["customer_outage"]["skipped"] = len(gated_outage_alerts)
+            results["customer_outage"]["skipped_reasons"]["quiet_hours"] = len(gated_outage_alerts)
+        else:
+            cust_res = await customer_notification_service.process_customer_outage_alerts(
+                repo=repo,
+                candidate_rows=gated_outage_alerts,
+                batch_id=batch_id,
+                config=config,
+                log=log,
+            )
+            results["customer_outage"].update(
+                {
+                    "pending": cust_res.get("pending", 0),
+                    "eligible": cust_res.get("eligible", 0),
+                    "sent": cust_res.get("sent", 0),
+                    "failed": cust_res.get("failed", 0),
+                    "skipped": cust_res.get("skipped", 0),
+                    "skipped_reasons": cust_res.get("skipped_reasons", {}),
+                }
+            )
+            _emit(
+                log,
+                f"[NOTIFY] Batch {batch_id}: customer outage sent={cust_res.get('sent', 0)} "
+                f"failed={cust_res.get('failed', 0)} skipped={cust_res.get('skipped', 0)}",
+            )
 
     weak_signal_policy = notification_service.get_alert_policy_status("outage", config)
     raw_weak_signal_alerts = load_weak_signal_rows(repo, batch_id)
