@@ -32,10 +32,45 @@ class DummyClient:
         return "ok"
 
 
+def test_individual_off_alert_gate_defaults_to_strict_enforce(monkeypatch):
+    monkeypatch.delenv("INDIVIDUAL_OFF_ALERT_GATE_MODE", raising=False)
+    monkeypatch.delenv("INDIVIDUAL_OFF_MIN_DURATION_MINUTES", raising=False)
+
+    config = notification_service._build_default_config()
+
+    assert notification_service.get_individual_off_alert_gate_mode(config) == "enforce"
+    assert notification_service.get_individual_off_min_duration_minutes(config) == 60
+
+
+def test_individual_off_alert_gate_invalid_values_fall_back_to_strict_defaults():
+    config = {
+        "individual_off_alert_gate_mode": "invalid",
+        "individual_off_min_duration_minutes": "zero",
+    }
+
+    assert notification_service.get_individual_off_alert_gate_mode(config) == "enforce"
+    assert notification_service.get_individual_off_min_duration_minutes(config) == 60
+
+
+def test_invalid_individual_off_gate_config_emits_non_sensitive_warning(capsys):
+    config = {
+        "individual_off_alert_gate_mode": "invalid",
+        "individual_off_min_duration_minutes": "zero",
+    }
+
+    notification_service._normalize_individual_off_alert_gate_config(config, warn=True)
+
+    output = capsys.readouterr().out
+    assert "INDIVIDUAL_OFF_ALERT_GATE_MODE" in output
+    assert "INDIVIDUAL_OFF_MIN_DURATION_MINUTES" in output
+    assert config["individual_off_alert_gate_mode"] == "enforce"
+    assert config["individual_off_min_duration_minutes"] == 60
+
+
 def test_openzca_client_builds_command_with_absolute_node_and_profile():
     client = OpenZcaClient(
         binary_path="/opt/openzca/bin/openzca",
-        profile="zalo2",
+        profile="TTVTST",
     )
 
     command = client._build_command(["msg", "send", "123", "hello"])
@@ -44,7 +79,7 @@ def test_openzca_client_builds_command_with_absolute_node_and_profile():
         client.node_path,
         "/opt/openzca/bin/openzca",
         "--profile",
-        "zalo2",
+        "TTVTST",
     ]
     assert command[4:] == ["msg", "send", "123", "hello"]
 
@@ -55,7 +90,7 @@ def test_send_zalo_message_to_thread_uses_openzca_client():
     sent = asyncio.run(
         notification_service.send_zalo_message_to_thread(
             "Noi dung canh bao",
-            "4761925886931896176",
+            "2842297344572809781",
             client=client,
         )
     )
@@ -63,7 +98,7 @@ def test_send_zalo_message_to_thread_uses_openzca_client():
     assert sent is True
     assert client.calls == [
         {
-            "thread_id": "4761925886931896176",
+            "thread_id": "2842297344572809781",
             "message": "Noi dung canh bao",
             "group": True,
         }
@@ -78,7 +113,7 @@ def test_send_zalo_message_to_thread_returns_false_on_transport_error():
     sent = asyncio.run(
         notification_service.send_zalo_message_to_thread(
             "Noi dung canh bao",
-            "4761925886931896176",
+            "2842297344572809781",
             client=FailingClient(),
         )
     )
@@ -94,13 +129,13 @@ def test_send_zalo_message_to_thread_detailed_returns_error_on_transport_error()
     result = asyncio.run(
         notification_service.send_zalo_message_to_thread_detailed(
             "Noi dung canh bao",
-            "4761925886931896176",
+            "2842297344572809781",
             client=FailingClient(),
         )
     )
 
     assert result["success"] is False
-    assert result["thread_id"] == "4761925886931896176"
+    assert result["thread_id"] == "2842297344572809781"
     assert "openzca unavailable" in result["error"]
 
 
@@ -115,13 +150,13 @@ def test_send_zalo_message_to_thread_detailed_prefers_client_detailed_result():
                 "stdout": "stdout message",
                 "stderr": "stderr message",
                 "returncode": 7,
-                "command": ["/node", "/openzca", "--profile", "zalo2", "msg", "send"],
+                "command": ["/node", "/openzca", "--profile", "TTVTST", "msg", "send"],
             }
 
     result = asyncio.run(
         notification_service.send_zalo_message_to_thread_detailed(
             "Noi dung canh bao",
-            "4761925886931896176",
+            "2842297344572809781",
             client=DetailedClient(),
         )
     )
@@ -130,7 +165,7 @@ def test_send_zalo_message_to_thread_detailed_prefers_client_detailed_result():
     assert result["stderr"] == "stderr message"
     assert result["stdout"] == "stdout message"
     assert result["returncode"] == 7
-    assert result["command"] == ["/node", "/openzca", "--profile", "zalo2", "msg", "send"]
+    assert result["command"] == ["/node", "/openzca", "--profile", "TTVTST", "msg", "send"]
 
 
 def test_send_zalo_message_to_user_detailed_uses_direct_message():
@@ -176,10 +211,10 @@ def test_send_zalo_message_to_thread_returns_false_without_thread():
 
 
 def test_get_zalo_thread_by_doi_vt_supports_short_aliases():
-    assert notification_service.get_zalo_thread_by_doi_vt("Sơn Tây") == "4761925886931896176"
-    assert notification_service.get_zalo_thread_by_doi_vt("Quảng Oai") == "7968537750365285360"
-    assert notification_service.get_zalo_thread_by_doi_vt("Suối hai") == "6052111621047664"
-    assert notification_service.get_zalo_thread_by_doi_vt("Phúc Thọ") == "3142012656522650111"
+    assert notification_service.get_zalo_thread_by_doi_vt("Sơn Tây") == "2842297344572809781"
+    assert notification_service.get_zalo_thread_by_doi_vt("Quảng Oai") == "860736048191000245"
+    assert notification_service.get_zalo_thread_by_doi_vt("Suối hai") == "7309795608264187957"
+    assert notification_service.get_zalo_thread_by_doi_vt("Phúc Thọ") == "5692189153216431290"
 
 
 def test_load_individual_zalo_mapping_from_config_file(tmp_path, monkeypatch):
@@ -758,7 +793,7 @@ def test_send_current_off_snapshot_by_doi_vt_splits_messages_by_nvkt(monkeypatch
     assert result["sent"] == 2
     assert result["failed"] == 0
     assert len(sent_messages) == 2
-    assert all(thread_id == "4761925886931896176" for thread_id, _message in sent_messages)
+    assert all(thread_id == "2842297344572809781" for thread_id, _message in sent_messages)
     assert "👷 Nguyen Van A (1 TB)" in sent_messages[0][1]
     assert "👷 Nguyen Van B (1 TB)" in sent_messages[1][1]
 

@@ -19,6 +19,7 @@ try:
         SubscriberSnapshot,
         WideAreaAlert,
     )
+    from . import notification_service
     from .notification_bridge import dispatch_batch_notifications
     from .subscriber_off_scoring import (
         LIKELY_SELF_POWER_OFF,
@@ -46,6 +47,7 @@ except ImportError:
         SubscriberSnapshot,
         WideAreaAlert,
     )
+    import notification_service
     from notification_bridge import dispatch_batch_notifications
     from subscriber_off_scoring import (
         LIKELY_SELF_POWER_OFF,
@@ -69,11 +71,13 @@ def _emit(log, message: str):
         log(message)
 
 
-def normalize_status(raw_status) -> str:
+def normalize_status(raw_status, olt_power_rx=None) -> str:
     status = str(raw_status or "").upper()
     if status == "PORT_DOWN":
         return "PORT_DOWN"
     if "OFF" in status:
+        if olt_power_rx is not None and -30 <= olt_power_rx <= -15:
+            return "ON"
         return "OFF"
     if "ON" in status:
         return "ON"
@@ -109,7 +113,7 @@ def _snapshot_from_row(row: Dict, metadata: Dict) -> SubscriberSnapshot:
         parent_port_key=get_parent_port_key(subscriber_key),
         olt_name=get_olt_name(subscriber_key),
         batch_id=row["batch_id"],
-        status=normalize_status(row.get("onuStatusStr")),
+        status=normalize_status(row.get("onuStatusStr"), row.get("oltPowerRx")),
         measured_at=_parse_measured_at(row),
         ma_tb=ma_tb,
         ten_tb=(metadata.get("Ten_Tb") or "").strip(),
@@ -591,6 +595,13 @@ def process_completed_batch(
     }
 
     _emit(log, f"[ALERT] Batch {batch_id}: applying pattern exclusion...")
+    notification_config = notification_service.load_config()
+    alert_gate_mode = notification_service.get_individual_off_alert_gate_mode(
+        notification_config
+    )
+    min_alert_duration_minutes = (
+        notification_service.get_individual_off_min_duration_minutes(notification_config)
+    )
     to_suppress, scoring_results = score_pattern_suppression_for_current_offs(
         db_path,
         current_offs,
@@ -598,6 +609,7 @@ def process_completed_batch(
         batch_id=batch_id,
         wide_area_subscriber_keys=wide_area_subscriber_keys,
         reference_time=measured_at,
+        min_alert_duration_minutes=min_alert_duration_minutes,
     )
     pattern_updates = update_exclusion_table_from_results(db_path, scoring_results)
     if to_suppress:
@@ -631,6 +643,8 @@ def process_completed_batch(
         exclusion_list=exclusion_list,
         wide_area_subscriber_keys=wide_area_subscriber_keys,
         wide_area_timing_by_subscriber=wide_area_timing_by_subscriber,
+        scoring_results=scoring_results,
+        alert_gate_mode=alert_gate_mode,
     )
     current_off_snapshot_file = str(get_snapshot_output_path(os.path.dirname(db_path) or "."))
     current_off_snapshot_payload = build_snapshot_payload(
@@ -640,6 +654,13 @@ def process_completed_batch(
         stale_assignment_suppressed=stale_assignment_suppressed,
     )
     write_snapshot_json(current_off_snapshot_payload, current_off_snapshot_file)
+    gate_summary = current_off_snapshot_payload["summary"]
+    _emit(
+        log,
+        f"[ALERT] Batch {batch_id}: individual OFF gate mode={alert_gate_mode} "
+        f"min_duration={min_alert_duration_minutes}m "
+        f"eligible={gate_summary['gate_eligible']} blocked={gate_summary['gate_blocked']}",
+    )
 
     notification_results = {}
     if send_notifications:
@@ -674,11 +695,9 @@ def process_completed_batch(
         "customer_poweroff_suppressed_count": len(customer_poweroff_suppressed_codes),
         "customer_poweroff_suppressed_subscribers": len(customer_poweroff_suppressed_results),
         "current_off_snapshot_total": len(current_off_snapshot_rows),
-        "current_off_snapshot_active": sum(
-            1
-            for row in current_off_snapshot_rows
-            if not row["suppressed_by_pattern"] and not row["suppressed_by_wide_area"]
-        ),
+        "current_off_snapshot_active": current_off_snapshot_payload["summary"][
+            "active_individual_alerts"
+        ],
         "current_off_snapshot_file": current_off_snapshot_file,
         "notifications": notification_results,
         "duration_seconds": duration_seconds,

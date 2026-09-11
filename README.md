@@ -34,6 +34,8 @@ Co the bat/tat va gioi han khung gio gui tung loai ban tin bang `.env`:
 - `INDIVIDUAL_ALERT_TIME_WINDOW=06:00-21:00`
 - `INDIVIDUAL_ALERT_START_TIME=06:00`
 - `INDIVIDUAL_ALERT_SEND_EVERY_BATCHES=1`
+- `INDIVIDUAL_OFF_ALERT_GATE_MODE=enforce`
+- `INDIVIDUAL_OFF_MIN_DURATION_MINUTES=60`
 - `INDIVIDUAL_ZALO_MAPPING_FILE=/duong/dan/individual_zalo_mapping.json`
 - `ENABLE_WIDE_AREA_ALERT_NOTIFICATIONS=True|False`
 - `WIDE_AREA_ALERT_TIME_WINDOW=00:00-23:59`
@@ -45,6 +47,7 @@ Bo trong bien `*_TIME_WINDOW` neu muon gui ca ngay. Dinh dang khung gio la `HH:M
 Bo trong bien `*_ALERT_START_TIME` neu muon gui tat ca thue bao OFF hien co. `CURRENT_OFF_ALERT_START_TIME` chi con la bien tuong thich nguoc, duoc dung lam fallback khi chua cau hinh `GROUP_ALERT_START_TIME` hoac `INDIVIDUAL_ALERT_START_TIME`.
 Bo bien `GROUP_ALERT_*` dieu khien rieng luong gui ban tin OFF vao cac nhom DOI_VT.
 Bo bien `INDIVIDUAL_ALERT_*` dieu khien rieng luong gui Zalo truc tiep den tung NVKT. Hai luong co cong tac bat/tat, khung gio, moc tinh ma OFF moi, va chu ky batch doc lap.
+`INDIVIDUAL_OFF_ALERT_GATE_MODE` mac dinh la `enforce`: ca ban tin OFF theo nhom va tin ca nhan chi nhan cac ma du bang chung su co. `shadow` chi ghi nhan quyet dinh nhung van gui nhu cu; `off` bo qua cong loc de rollback nhanh. `INDIVIDUAL_OFF_MIN_DURATION_MINUTES` mac dinh 60 phut. Canh bao dien rong va tin hieu yeu khong di qua cong loc nay.
 Bien `*_ALERT_SEND_EVERY_BATCHES` quy dinh nhip gui theo chu ky toan cuc cua tung luong. Gia tri `1` giu hanh vi gui moi chu ky hop le; gia tri `x > 1` chi gui o moi chu ky thu `x`, `2x`, `3x`... Bo dem duoc luu trong SQLite rieng cho tung luong.
 Bien `INDIVIDUAL_ZALO_MAPPING_FILE` tro den file JSON anh xa NVKT sang Zalo user id. Neu bo trong, chuong trinh tim file `individual_zalo_mapping.json` trong thu muc repo. Dinh dang:
 

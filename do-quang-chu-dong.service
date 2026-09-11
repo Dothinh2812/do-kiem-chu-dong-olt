@@ -1,0 +1,19 @@
+[Unit]
+Description=Do quang chu dong OLT app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vtst
+Group=vtst
+WorkingDirectory=/home/vtst/do_chu_dong_api
+Environment=HOME=/home/vtst
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /home/vtst/do_chu_dong_api/app.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

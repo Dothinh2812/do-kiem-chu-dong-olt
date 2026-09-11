@@ -197,6 +197,9 @@ def fetch_all(measurement_db, sql, params=()):
 def test_normalize_status():
     assert normalize_status("ON") == "ON"
     assert normalize_status("offline") == "OFF"
+    assert normalize_status("offline", olt_power_rx=-20) == "ON"
+    assert normalize_status("offline", olt_power_rx=-10) == "OFF"
+    assert normalize_status("offline", olt_power_rx=-35) == "OFF"
     assert normalize_status("Power ON") == "ON"
     assert normalize_status(None) == "UNKNOWN"
 
@@ -1007,14 +1010,18 @@ def test_process_completed_batch_writes_current_off_snapshot_json(db_paths):
     payload = json.loads(snapshot_file.read_text(encoding="utf-8"))
 
     assert result["current_off_snapshot_total"] == 1
-    assert result["current_off_snapshot_active"] == 1
+    assert result["current_off_snapshot_active"] == 0
     assert payload["batch_id"] == "b4"
     assert payload["summary"]["total_off_subscribers"] == 1
-    assert payload["summary"]["active_individual_alerts"] == 1
+    assert payload["summary"]["active_individual_alerts"] == 0
+    assert payload["summary"]["individual_off_alert_gate_mode"] == "enforce"
+    assert payload["summary"]["gate_eligible"] == 0
     assert payload["subscribers"][0]["ma_tb"] == "TB001"
     assert payload["subscribers"][0]["first_off_time"] == "2026-04-24T08:10:00"
     assert payload["subscribers"][0]["duration_minutes"] == 5
     assert payload["subscribers"][0]["duration_text"] == "5 phút"
+    assert payload["subscribers"][0]["alert_eligible"] is False
+    assert payload["subscribers"][0]["alert_eligibility_reason"] == "minimum_duration_not_reached"
 
 
 def test_current_off_snapshot_keeps_suppressed_records_with_reason(db_paths):

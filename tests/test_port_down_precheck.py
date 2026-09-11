@@ -230,6 +230,7 @@ def test_port_down_snapshot_row_keeps_current_status_port_down():
 
 def test_alert_engine_normalize_status_preserves_port_down():
     assert alert_engine.normalize_status("PORT_DOWN") == "PORT_DOWN"
+    assert alert_engine.normalize_status("PORT_DOWN", olt_power_rx=-20) == "PORT_DOWN"
 
 
 def test_process_completed_batch_marks_port_down_subscribers_as_wide_area(tmp_path):

@@ -2,19 +2,27 @@ from typing import Optional
 
 
 CANONICAL_DOI_VT_TO_THREAD = {
-    "Tổ Kỹ thuật Địa bàn Quảng Oai": "7968537750365285360",
-    "Tổ Kỹ thuật Địa bàn Sơn Tây": "4761925886931896176",
-    "Tổ Kỹ thuật Địa bàn Suối Hai": "6052111621047664",
-    "Tổ Kỹ thuật Địa bàn Phúc Thọ": "3142012656522650111",
+    "Tổ Kỹ thuật Địa bàn Quảng Oai": "860736048191000245",
+    "Tổ Kỹ thuật Địa bàn Sơn Tây": "2842297344572809781",
+    "Tổ Kỹ thuật Địa bàn Suối Hai": "7309795608264187957",
+    "Tổ Kỹ thuật Địa bàn Phúc Thọ": "5692189153216431290",
 }
 
 
 DOI_VT_ALIASES = {
     "Quảng Oai": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+    "QOI": "Tổ Kỹ thuật Địa bàn Quảng Oai",
+    "QOI - cb": "Tổ Kỹ thuật Địa bàn Quảng Oai",
     "Sơn Tây": "Tổ Kỹ thuật Địa bàn Sơn Tây",
+    "STY": "Tổ Kỹ thuật Địa bàn Sơn Tây",
+    "STY - cb": "Tổ Kỹ thuật Địa bàn Sơn Tây",
     "Suối hai": "Tổ Kỹ thuật Địa bàn Suối Hai",
     "Suối Hai": "Tổ Kỹ thuật Địa bàn Suối Hai",
+    "SHI": "Tổ Kỹ thuật Địa bàn Suối Hai",
+    "SHI - cb": "Tổ Kỹ thuật Địa bàn Suối Hai",
     "Phúc Thọ": "Tổ Kỹ thuật Địa bàn Phúc Thọ",
+    "PTO": "Tổ Kỹ thuật Địa bàn Phúc Thọ",
+    "PTO - cb": "Tổ Kỹ thuật Địa bàn Phúc Thọ",
     "Tổ Kỹ thuật Địa bàn Quảng Oai": "Tổ Kỹ thuật Địa bàn Quảng Oai",
     "Tổ Kỹ thuật Địa bàn Sơn Tây": "Tổ Kỹ thuật Địa bàn Sơn Tây",
     "Tổ Kỹ thuật Địa bàn Suối hai": "Tổ Kỹ thuật Địa bàn Suối Hai",

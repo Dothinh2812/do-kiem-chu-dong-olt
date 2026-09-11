@@ -21,6 +21,8 @@ MIN_HISTORY_EVENTS_FOR_SELF_POWER_OFF = 3
 MIN_SELF_POWER_OFF_SCORE = 70
 WIDE_AREA_PORT_OFF_THRESHOLD = 5
 MAJOR_INCIDENT_OFF_COUNT_THRESHOLD = 800
+DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES = 60
+INDIVIDUAL_OFF_ALERT_RULE_VERSION = "precision-v1"
 
 SCORE_CSV_FIELDNAMES = [
     "ma_tb",
@@ -39,8 +41,12 @@ SCORE_CSV_FIELDNAMES = [
     "median_off_duration_hours",
     "p90_off_duration_hours",
     "current_off_duration_hours",
+    "current_off_duration_minutes",
     "current_off_duration_vs_p90",
     "same_port_off_count",
+    "alert_eligible",
+    "alert_eligibility_reason",
+    "alert_rule_version",
     "reasons",
 ]
 
@@ -79,6 +85,9 @@ class OffScoringResult:
     wide_area_score: int
     features: Dict[str, float] = field(default_factory=dict)
     reasons: List[str] = field(default_factory=list)
+    alert_eligible: bool = False
+    alert_eligibility_reason: str = "decision_unavailable"
+    alert_rule_version: str = INDIVIDUAL_OFF_ALERT_RULE_VERSION
 
     def to_csv_row(self) -> Dict:
         return {
@@ -98,8 +107,12 @@ class OffScoringResult:
             "median_off_duration_hours": self.features.get("median_off_duration_hours", 0),
             "p90_off_duration_hours": self.features.get("p90_off_duration_hours", 0),
             "current_off_duration_hours": self.features.get("current_off_duration_hours", 0),
+            "current_off_duration_minutes": self.features.get("current_off_duration_minutes", 0),
             "current_off_duration_vs_p90": self.features.get("current_off_duration_vs_p90", 0),
             "same_port_off_count": self.features.get("same_port_off_count", 0),
+            "alert_eligible": self.alert_eligible,
+            "alert_eligibility_reason": self.alert_eligibility_reason,
+            "alert_rule_version": self.alert_rule_version,
             "reasons": "; ".join(self.reasons),
         }
 
@@ -139,6 +152,9 @@ def _hour_distance(left: int, right: int) -> int:
     return min(diff, 24 - diff)
 
 
+MIN_COMMON_HOUR_COUNT = 3
+
+
 def _history_features(context: OffEventContext, history: Sequence[OFFHistoryEvent]) -> Dict[str, float]:
     durations_hours = [
         max(event.outage_duration_minutes, 0) / 60
@@ -151,29 +167,66 @@ def _history_features(context: OffEventContext, history: Sequence[OFFHistoryEven
         hour_counts[hour] = hour_counts.get(hour, 0) + 1
     most_common_hour = max(hour_counts, key=hour_counts.get) if hour_counts else None
     hour_consistency = hour_counts[most_common_hour] / len(hours) if most_common_hour is not None else 0.0
-    current_duration_hours = max(
-        (context.reference_time - context.first_off_time).total_seconds() / 3600,
+    common_hours = sorted(h for h, c in hour_counts.items() if c >= MIN_COMMON_HOUR_COUNT)
+    current_hour = context.first_off_time.hour
+    if common_hours:
+        current_hour_distance = min(_hour_distance(current_hour, h) for h in common_hours)
+    elif most_common_hour is not None:
+        current_hour_distance = _hour_distance(current_hour, most_common_hour)
+    else:
+        current_hour_distance = 24
+    current_duration_seconds = max(
+        (context.reference_time - context.first_off_time).total_seconds(),
         0,
     )
+    current_duration_hours = current_duration_seconds / 3600
     p90_duration_hours = _percentile(durations_hours, 0.9)
     duration_vs_p90 = current_duration_hours / p90_duration_hours if p90_duration_hours else 0.0
-    current_hour_distance = (
-        _hour_distance(context.first_off_time.hour, most_common_hour)
-        if most_common_hour is not None
-        else 24
-    )
 
     return {
         "history_event_count": len(history),
         "most_common_off_hour": most_common_hour if most_common_hour is not None else "",
+        "common_off_hours": common_hours,
         "off_hour_consistency": round(hour_consistency, 4),
         "median_off_duration_hours": round(median(durations_hours), 4) if durations_hours else 0.0,
         "p90_off_duration_hours": round(p90_duration_hours, 4),
         "current_off_duration_hours": current_duration_hours,
+        "current_off_duration_minutes": max(int(current_duration_seconds // 60), 0),
         "current_off_duration_vs_p90": round(duration_vs_p90, 4),
         "current_hour_distance": current_hour_distance,
         "same_port_off_count": context.same_port_off_count,
     }
+
+
+def apply_individual_alert_eligibility(
+    result: OffScoringResult,
+    min_duration_minutes: int = DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES,
+) -> OffScoringResult:
+    """Attach a strict, explainable notification decision to a scoring result."""
+    threshold = max(int(min_duration_minutes or DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES), 1)
+    duration_minutes = max(
+        int(result.features.get("current_off_duration_minutes", 0) or 0),
+        0,
+    )
+    history_count = max(int(result.features.get("history_event_count", 0) or 0), 0)
+
+    result.alert_eligible = False
+    result.alert_rule_version = INDIVIDUAL_OFF_ALERT_RULE_VERSION
+    if result.classification == WIDE_AREA_OR_PORT_INCIDENT:
+        result.alert_eligibility_reason = "wide_area_or_port_incident"
+    elif result.classification == LIKELY_SELF_POWER_OFF:
+        result.alert_eligibility_reason = "likely_self_power_off"
+    elif duration_minutes < threshold:
+        result.alert_eligibility_reason = "minimum_duration_not_reached"
+    elif result.classification == LIKELY_INDIVIDUAL_FAULT:
+        result.alert_eligible = True
+        result.alert_eligibility_reason = "classified_individual_fault"
+    elif history_count == 0:
+        result.alert_eligible = True
+        result.alert_eligibility_reason = "no_history_absolute_duration"
+    else:
+        result.alert_eligibility_reason = "uncertain_fault_evidence"
+    return result
 
 
 def classify_off_event(
@@ -274,7 +327,7 @@ def classify_off_event(
         classification = UNCERTAIN
         confidence = max(self_score, fault_score, wide_area_score)
 
-    return OffScoringResult(
+    result = OffScoringResult(
         subscriber_key=context.subscriber_key,
         parent_port_key=context.parent_port_key,
         batch_id=context.batch_id,
@@ -288,6 +341,7 @@ def classify_off_event(
         features=features,
         reasons=reasons,
     )
+    return apply_individual_alert_eligibility(result)
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -624,6 +678,7 @@ def score_current_off_snapshots(
     wide_area_subscriber_keys: Optional[Set[str]] = None,
     reference_time: Optional[datetime] = None,
     history_days: int = 30,
+    min_alert_duration_minutes: int = DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES,
 ) -> List[OffScoringResult]:
     wide_area_set = set(wide_area_subscriber_keys or set())
     port_counts: Dict[str, int] = {}
@@ -663,7 +718,10 @@ def score_current_off_snapshots(
         )
 
     return [
-        classify_off_event(context, history_by_subscriber.get(context.subscriber_key, []))
+        apply_individual_alert_eligibility(
+            classify_off_event(context, history_by_subscriber.get(context.subscriber_key, [])),
+            min_duration_minutes=min_alert_duration_minutes,
+        )
         for context in contexts
     ]
 
@@ -678,6 +736,7 @@ def score_pattern_suppression_for_current_offs(
     reference_time: Optional[datetime] = None,
     min_self_poweroff_score: int = MIN_SELF_POWER_OFF_SCORE,
     history_days: int = 30,
+    min_alert_duration_minutes: int = DEFAULT_INDIVIDUAL_OFF_MIN_DURATION_MINUTES,
 ) -> tuple[List[str], List[OffScoringResult]]:
     results = score_current_off_snapshots(
         db_path,
@@ -687,6 +746,7 @@ def score_pattern_suppression_for_current_offs(
         wide_area_subscriber_keys=wide_area_subscriber_keys,
         reference_time=reference_time,
         history_days=history_days,
+        min_alert_duration_minutes=min_alert_duration_minutes,
     )
     subscriber_keys = [
         result.subscriber_key

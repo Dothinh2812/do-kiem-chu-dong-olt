@@ -22,3 +22,8 @@ runtime/
 venv/
 .venv/
 env/
+
+*.csv
+.antigravitycli/
+.codegraph/
+

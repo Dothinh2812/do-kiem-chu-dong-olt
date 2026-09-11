@@ -109,6 +109,125 @@ def test_classify_unusual_long_off_as_individual_fault():
     assert result.individual_fault_score >= 70
     assert result.self_poweroff_score < 70
     assert result.features["current_off_duration_vs_p90"] > 10
+    assert result.alert_eligible is True
+    assert result.alert_eligibility_reason == "classified_individual_fault"
+
+
+def test_no_history_requires_absolute_sixty_minute_duration_for_alert():
+    before_threshold = classify_off_event(
+        OffEventContext(
+            subscriber_key="sub-new",
+            parent_port_key="port-1",
+            batch_id="b1",
+            ma_tb="TBNEW",
+            ten_tb="Khach hang moi",
+            first_off_time=datetime(2026, 4, 23, 8, 0, 0),
+            reference_time=datetime(2026, 4, 23, 8, 59, 0),
+            same_port_off_count=1,
+        ),
+        [],
+    )
+    at_threshold = classify_off_event(
+        OffEventContext(
+            subscriber_key="sub-new",
+            parent_port_key="port-1",
+            batch_id="b2",
+            ma_tb="TBNEW",
+            ten_tb="Khach hang moi",
+            first_off_time=datetime(2026, 4, 23, 8, 0, 0),
+            reference_time=datetime(2026, 4, 23, 9, 0, 0),
+            same_port_off_count=1,
+        ),
+        [],
+    )
+
+    assert before_threshold.alert_eligible is False
+    assert before_threshold.alert_eligibility_reason == "minimum_duration_not_reached"
+    assert at_threshold.alert_eligible is True
+    assert at_threshold.alert_eligibility_reason == "no_history_absolute_duration"
+
+
+def test_likely_self_power_off_stays_ineligible_after_duration_threshold():
+    context = OffEventContext(
+        subscriber_key="sub-pattern",
+        parent_port_key="port-1",
+        batch_id="b4",
+        ma_tb="TBPATTERN",
+        ten_tb="Khach hang",
+        first_off_time=datetime(2026, 4, 23, 7, 13, 0),
+        reference_time=datetime(2026, 4, 23, 9, 13, 0),
+        same_port_off_count=1,
+    )
+    history = [
+        OFFHistoryEvent(
+            outage_time=datetime(2026, 4, 21, 7, 18, 0),
+            recovery_time=datetime(2026, 4, 21, 17, 33, 0),
+            outage_duration_minutes=615,
+        ),
+        OFFHistoryEvent(
+            outage_time=datetime(2026, 4, 22, 7, 16, 0),
+            recovery_time=datetime(2026, 4, 22, 17, 31, 0),
+            outage_duration_minutes=615,
+        ),
+    ]
+
+    result = classify_off_event(context, history)
+
+    assert result.classification == LIKELY_SELF_POWER_OFF
+    assert result.alert_eligible is False
+    assert result.alert_eligibility_reason == "likely_self_power_off"
+
+
+def test_classify_bimodal_off_pattern_matches_common_hours():
+    history = [
+        OFFHistoryEvent(
+            outage_time=datetime(2026, 5, 1, 11, 5, 0),
+            recovery_time=datetime(2026, 5, 1, 11, 20, 0),
+            outage_duration_minutes=15,
+        ),
+        OFFHistoryEvent(
+            outage_time=datetime(2026, 5, 2, 17, 10, 0),
+            recovery_time=datetime(2026, 5, 2, 17, 25, 0),
+            outage_duration_minutes=15,
+        ),
+        OFFHistoryEvent(
+            outage_time=datetime(2026, 5, 3, 11, 8, 0),
+            recovery_time=datetime(2026, 5, 3, 11, 23, 0),
+            outage_duration_minutes=15,
+        ),
+        OFFHistoryEvent(
+            outage_time=datetime(2026, 5, 4, 17, 5, 0),
+            recovery_time=datetime(2026, 5, 4, 17, 20, 0),
+            outage_duration_minutes=15,
+        ),
+        OFFHistoryEvent(
+            outage_time=datetime(2026, 5, 5, 11, 10, 0),
+            recovery_time=datetime(2026, 5, 5, 11, 25, 0),
+            outage_duration_minutes=15,
+        ),
+        OFFHistoryEvent(
+            outage_time=datetime(2026, 5, 6, 17, 8, 0),
+            recovery_time=datetime(2026, 5, 6, 17, 23, 0),
+            outage_duration_minutes=15,
+        ),
+    ]
+    context = OffEventContext(
+        subscriber_key="sub-bimodal",
+        parent_port_key="port-1",
+        batch_id="b1",
+        ma_tb="TB700",
+        ten_tb="Khach hang",
+        first_off_time=datetime(2026, 5, 7, 11, 12, 0),
+        reference_time=datetime(2026, 5, 7, 11, 30, 0),
+        same_port_off_count=1,
+    )
+
+    result = classify_off_event(context, history)
+
+    assert result.classification == LIKELY_SELF_POWER_OFF
+    assert result.self_poweroff_score >= 70
+    assert result.features["common_off_hours"] == [11, 17]
+    assert result.features["current_hour_distance"] <= 1
 
 
 def test_classify_wide_area_context_as_port_incident():

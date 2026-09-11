@@ -37,6 +37,8 @@ def build_snapshot_row(
     suppression_reason: str = "",
     override_first_off_time=None,
     override_duration_minutes: Optional[int] = None,
+    alert_decision: Optional[Dict] = None,
+    alert_gate_mode: str = "off",
 ) -> Dict:
     state = state or {}
     first_off_time = (
@@ -51,6 +53,7 @@ def build_snapshot_row(
         duration_minutes = max(int((measured_at - first_off_time).total_seconds() // 60), 0)
     else:
         duration_minutes = 0
+    decision = alert_decision or {}
     return {
         "subscriber_key": snapshot.subscriber_key,
         "port_id": snapshot.port_id,
@@ -75,6 +78,17 @@ def build_snapshot_row(
         "suppressed_by_pattern": bool(suppressed_by_pattern),
         "suppressed_by_wide_area": bool(suppressed_by_wide_area),
         "suppression_reason": suppression_reason or "",
+        "alert_gate_mode": alert_gate_mode,
+        "alert_eligible": bool(decision.get("alert_eligible", False)),
+        "alert_eligibility_reason": decision.get(
+            "alert_eligibility_reason",
+            "decision_unavailable",
+        ),
+        "alert_rule_version": decision.get("alert_rule_version", ""),
+        "off_classification": decision.get("classification", ""),
+        "individual_fault_score": decision.get("individual_fault_score", 0),
+        "self_poweroff_score": decision.get("self_poweroff_score", 0),
+        "history_event_count": decision.get("history_event_count", 0),
     }
 
 
@@ -85,10 +99,23 @@ def build_current_off_snapshot(
     exclusion_list: Optional[Iterable[str]] = None,
     wide_area_subscriber_keys: Optional[Iterable[str]] = None,
     wide_area_timing_by_subscriber: Optional[Dict[str, Dict]] = None,
+    scoring_results: Optional[Iterable] = None,
+    alert_gate_mode: str = "off",
 ) -> List[Dict]:
     exclusion_set = {ma_tb for ma_tb in (exclusion_list or []) if ma_tb}
     wide_area_set = set(wide_area_subscriber_keys or [])
     wide_area_timing_by_subscriber = wide_area_timing_by_subscriber or {}
+    scoring_by_subscriber = {}
+    for result in scoring_results or []:
+        scoring_by_subscriber[result.subscriber_key] = {
+            "alert_eligible": result.alert_eligible,
+            "alert_eligibility_reason": result.alert_eligibility_reason,
+            "alert_rule_version": result.alert_rule_version,
+            "classification": result.classification,
+            "individual_fault_score": result.individual_fault_score,
+            "self_poweroff_score": result.self_poweroff_score,
+            "history_event_count": result.features.get("history_event_count", 0),
+        }
     rows: List[Dict] = []
     for snapshot in current_offs:
         ma_tb = getattr(snapshot, "ma_tb", "") or ""
@@ -109,6 +136,8 @@ def build_current_off_snapshot(
                 suppression_reason=",".join(reasons),
                 override_first_off_time=wide_area_timing.get("first_off_time") if suppressed_by_wide_area else None,
                 override_duration_minutes=wide_area_timing.get("duration_minutes") if suppressed_by_wide_area else None,
+                alert_decision=scoring_by_subscriber.get(snapshot.subscriber_key),
+                alert_gate_mode=alert_gate_mode,
             )
         )
     rows.sort(key=lambda row: (row["doi_vt"], row["ten_nvkt_db"], row["subscriber_key"]))
@@ -126,6 +155,19 @@ def build_snapshot_payload(
     measured_at_dt = _coerce_datetime(measured_at)
     pattern_count = sum(1 for row in subscribers if row.get("suppressed_by_pattern"))
     wide_area_count = sum(1 for row in subscribers if row.get("suppressed_by_wide_area"))
+    gate_mode = next(
+        (str(row.get("alert_gate_mode") or "off") for row in subscribers),
+        "off",
+    )
+    gate_candidate_rows = [
+        row
+        for row in subscribers
+        if not row.get("suppressed_by_pattern") and not row.get("suppressed_by_wide_area")
+    ]
+    gate_eligible_count = sum(
+        1 for row in gate_candidate_rows if row.get("alert_eligible") is True
+    )
+    gate_blocked_count = len(gate_candidate_rows) - gate_eligible_count
     group_count_by_doi_vt: Dict[str, int] = {}
     for row in subscribers:
         doi_vt = row.get("doi_vt") or "Không xác định"
@@ -140,7 +182,11 @@ def build_snapshot_payload(
                 1
                 for row in subscribers
                 if not row.get("suppressed_by_pattern") and not row.get("suppressed_by_wide_area")
+                and (gate_mode != "enforce" or row.get("alert_eligible") is True)
             ),
+            "individual_off_alert_gate_mode": gate_mode,
+            "gate_eligible": gate_eligible_count,
+            "gate_blocked": gate_blocked_count,
             "suppressed_by_pattern": pattern_count,
             "suppressed_by_wide_area": wide_area_count,
             "suppressed_total": sum(
