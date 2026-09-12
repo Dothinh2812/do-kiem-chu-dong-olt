@@ -40,6 +40,27 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _parse_strict_bool(val, default: bool = True, name: str = "") -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if val == 1:
+            return True
+        if val == 0:
+            return False
+    if isinstance(val, str):
+        token = val.strip().lower()
+        if token in {"true", "1", "yes", "on"}:
+            return True
+        if token in {"false", "0", "no", "off"}:
+            return False
+    import warnings
+    warnings.warn(
+        f"Invalid boolean value for config {name}: {repr(val)}. Enforcing default {default}."
+    )
+    return default
+
+
 def _env_str(name: str, default: str = "") -> str:
     return str(os.environ.get(name, default) or "").strip()
 
@@ -98,6 +119,8 @@ def _build_default_config() -> Dict:
         ),
         "enable_customer_outage_alert": _env_bool("ENABLE_CUSTOMER_OUTAGE_ALERT", False),
         "customer_alert_time_window": _env_str("CUSTOMER_ALERT_TIME_WINDOW", "07:00-21:00"),
+        "customer_alert_start_time": _env_str("CUSTOMER_ALERT_START_TIME", "08:00"),
+        "customer_alert_end_time": _env_str("CUSTOMER_ALERT_END_TIME", "16:00"),
         "customer_alert_hotline": _env_str("CUSTOMER_ALERT_HOTLINE", "0822036382"),
         "telecom_zalo_api_url": _env_str("TELECOM_ZALO_API_URL", "http://localhost:3002"),
         "telecom_zalo_api_key": _env_str("TELECOM_ZALO_API_KEY", ""),
@@ -105,6 +128,26 @@ def _build_default_config() -> Dict:
         "customer_alert_max_per_week": _env_int("CUSTOMER_ALERT_MAX_PER_WEEK", 3),
         "customer_alert_send_timeout_seconds": float(
             os.environ.get("CUSTOMER_ALERT_SEND_TIMEOUT_SECONDS", "3.0")
+        ),
+        "enable_customer_ticket_precheck": _parse_strict_bool(
+            os.environ.get("ENABLE_CUSTOMER_TICKET_PRECHECK", "true"),
+            default=True,
+            name="ENABLE_CUSTOMER_TICKET_PRECHECK",
+        ),
+        "customer_ticket_precheck_request_timeout_seconds": float(
+            os.environ.get("CUSTOMER_TICKET_PRECHECK_REQUEST_TIMEOUT_SECONDS", "5.0")
+        ),
+        "customer_ticket_precheck_batch_timeout_seconds": float(
+            os.environ.get("CUSTOMER_TICKET_PRECHECK_BATCH_TIMEOUT_SECONDS", "30.0")
+        ),
+        "customer_ticket_precheck_max_workers": int(
+            os.environ.get("CUSTOMER_TICKET_PRECHECK_MAX_WORKERS", "4")
+        ),
+        "customer_ticket_precheck_max_fact_age_seconds": float(
+            os.environ.get("CUSTOMER_TICKET_PRECHECK_MAX_FACT_AGE_SECONDS", "60.0")
+        ),
+        "customer_ticket_precheck_claim_lease_seconds": float(
+            os.environ.get("CUSTOMER_TICKET_PRECHECK_CLAIM_LEASE_SECONDS", "120.0")
         ),
     }
 
@@ -149,7 +192,69 @@ def load_config() -> Dict:
         except Exception as exc:
             print(f"⚠️ Could not load {CONFIG_FILE}: {exc}")
     _normalize_individual_off_alert_gate_config(config, warn=True)
+    _normalize_customer_ticket_precheck_config(config, warn=True)
     return config
+
+
+def _normalize_customer_ticket_precheck_config(config: Dict, *, warn: bool = False) -> None:
+    raw_enabled = config.get("enable_customer_ticket_precheck", True)
+    enabled = _parse_strict_bool(
+        raw_enabled, default=True, name="enable_customer_ticket_precheck"
+    )
+    config["enable_customer_ticket_precheck"] = enabled
+    if not enabled and warn:
+        print("[WARNING] enable_customer_ticket_precheck is False: customer ticket precheck is BYPASSED")
+
+    def _safe_float(val, default: float) -> float:
+        try:
+            v = float(val)
+            return v if v > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    def _safe_int(val, default: int) -> int:
+        try:
+            v = int(val)
+            return v if v > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    raw_req_timeout = config.get("customer_ticket_precheck_request_timeout_seconds")
+    req_timeout = _safe_float(raw_req_timeout, 5.0)
+    if raw_req_timeout is not None and req_timeout != raw_req_timeout and warn:
+        print("⚠️ Invalid customer_ticket_precheck_request_timeout_seconds; using 5.0")
+    config["customer_ticket_precheck_request_timeout_seconds"] = req_timeout
+
+    raw_batch_timeout = config.get("customer_ticket_precheck_batch_timeout_seconds")
+    batch_timeout = _safe_float(raw_batch_timeout, 30.0)
+    if raw_batch_timeout is not None and batch_timeout != raw_batch_timeout and warn:
+        print("⚠️ Invalid customer_ticket_precheck_batch_timeout_seconds; using 30.0")
+    config["customer_ticket_precheck_batch_timeout_seconds"] = batch_timeout
+
+    raw_max_workers = config.get("customer_ticket_precheck_max_workers")
+    max_workers = _safe_int(raw_max_workers, 4)
+    if raw_max_workers is not None and max_workers != raw_max_workers and warn:
+        print("⚠️ Invalid customer_ticket_precheck_max_workers; using 4")
+    config["customer_ticket_precheck_max_workers"] = max_workers
+
+    raw_fact_age = config.get("customer_ticket_precheck_max_fact_age_seconds")
+    max_fact_age = _safe_float(raw_fact_age, 60.0)
+    if raw_fact_age is not None and max_fact_age != raw_fact_age and warn:
+        print("⚠️ Invalid customer_ticket_precheck_max_fact_age_seconds; using 60.0")
+    config["customer_ticket_precheck_max_fact_age_seconds"] = max_fact_age
+
+    gateway_timeout = _safe_float(config.get("customer_alert_send_timeout_seconds"), 3.0)
+
+    min_lease = batch_timeout + req_timeout + max_fact_age + gateway_timeout
+    claim_lease = _safe_float(config.get("customer_ticket_precheck_claim_lease_seconds"), 120.0)
+    if claim_lease < min_lease:
+        if warn:
+            print(
+                f"[WARNING] customer_ticket_precheck_claim_lease_seconds ({claim_lease}) "
+                f"< minimum required ({min_lease}). Adjusting to {min_lease}."
+            )
+        claim_lease = min_lease
+    config["customer_ticket_precheck_claim_lease_seconds"] = claim_lease
 
 
 def _normalize_individual_off_alert_gate_config(config: Dict, *, warn: bool = False) -> None:
@@ -467,6 +572,8 @@ def get_current_off_alert_cutoff(
     active_config = config or load_config()
     if start_time_key in active_config:
         start_time_raw = str(active_config.get(start_time_key, "") or "").strip()
+    elif start_time_key == "customer_alert_start_time":
+        start_time_raw = "08:00"
     else:
         start_time_raw = str(active_config.get("current_off_alert_start_time", "") or "").strip()
     if not start_time_raw:
@@ -482,21 +589,57 @@ def get_current_off_alert_cutoff(
     return datetime.combine(current_day, start_time)
 
 
+def get_current_off_alert_end_cutoff(
+    config: Optional[Dict] = None,
+    now: Optional[datetime] = None,
+    end_time_key: str = "customer_alert_end_time",
+) -> Optional[datetime]:
+    active_config = config if config is not None else load_config()
+    if end_time_key in active_config:
+        end_time_raw = str(active_config.get(end_time_key, "") or "").strip()
+    elif end_time_key == "customer_alert_end_time":
+        end_time_raw = "16:00"
+    else:
+        return None
+    if not end_time_raw:
+        return None
+
+    try:
+        end_time = _parse_hhmm(end_time_raw)
+    except ValueError:
+        print(f"⚠️ Invalid alert end time '{end_time_raw}' for {end_time_key}")
+        return None
+
+    current_day = (now or datetime.now()).date()
+    return datetime.combine(current_day, end_time)
+
+
 def filter_current_off_alerts_by_cutoff(
     alerts: List,
     config: Optional[Dict] = None,
     now: Optional[datetime] = None,
     start_time_key: str = "current_off_alert_start_time",
+    end_time_key: Optional[str] = None,
 ) -> List:
-    cutoff = get_current_off_alert_cutoff(config=config, now=now, start_time_key=start_time_key)
-    if cutoff is None:
+    start_cutoff = get_current_off_alert_cutoff(config=config, now=now, start_time_key=start_time_key)
+    end_cutoff = (
+        get_current_off_alert_end_cutoff(config=config, now=now, end_time_key=end_time_key)
+        if end_time_key
+        else None
+    )
+    if start_cutoff is None and end_cutoff is None:
         return list(alerts)
 
     filtered = []
     for alert in alerts:
         first_off_time = _coerce_datetime(_value(alert, "first_off_time"))
-        if first_off_time and first_off_time >= cutoff:
-            filtered.append(alert)
+        if not first_off_time:
+            continue
+        if start_cutoff is not None and first_off_time < start_cutoff:
+            continue
+        if end_cutoff is not None and first_off_time > end_cutoff:
+            continue
+        filtered.append(alert)
     return filtered
 
 

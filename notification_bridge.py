@@ -289,6 +289,30 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
             "failed": 0,
             "skipped": 0,
             "skipped_reasons": {},
+            "classification_counts": {
+                "CUSTOMER_OPEN_TICKET": 0,
+                "CLEAR": 0,
+                "INDETERMINATE": 0,
+            },
+            "failure_kind_counts": {
+                "NONE": 0,
+                "AUTH": 0,
+                "API": 0,
+                "REQUEST_TIMEOUT": 0,
+                "BATCH_TIMEOUT": 0,
+                "PARTIAL": 0,
+                "AMBIGUOUS": 0,
+                "CONTRACT": 0,
+            },
+            "onebss_checked": 0,
+            "onebss_retried": 0,
+            "onebss_stale": 0,
+            "onebss_deadline_expired": 0,
+            "onebss_request_count": 0,
+            "onebss_request_duration_ms_total": 0.0,
+            "onebss_request_duration_ms_max": 0.0,
+            "onebss_batch_duration_ms": 0.0,
+            "precheck_state": "ENFORCED",
         },
     }
     config = notification_service.load_config()
@@ -635,21 +659,17 @@ async def _dispatch(repo: AlertRepository, batch_id: str, log=print) -> Dict:
                 config=config,
                 log=log,
             )
-            results["customer_outage"].update(
-                {
-                    "pending": cust_res.get("pending", 0),
-                    "eligible": cust_res.get("eligible", 0),
-                    "sent": cust_res.get("sent", 0),
-                    "failed": cust_res.get("failed", 0),
-                    "skipped": cust_res.get("skipped", 0),
-                    "skipped_reasons": cust_res.get("skipped_reasons", {}),
-                }
-            )
+            results["customer_outage"].update(cust_res)
             _emit(
                 log,
                 f"[NOTIFY] Batch {batch_id}: customer outage sent={cust_res.get('sent', 0)} "
-                f"failed={cust_res.get('failed', 0)} skipped={cust_res.get('skipped', 0)}",
+                f"failed={cust_res.get('failed', 0)} skipped={cust_res.get('skipped', 0)} "
+                f"precheck={cust_res.get('precheck_state', 'ENFORCED')} "
+                f"checked={cust_res.get('onebss_checked', 0)} "
+                f"retried={cust_res.get('onebss_retried', 0)}",
             )
+            if cust_res.get("precheck_state") == "BYPASSED":
+                _emit(log, f"[WARNING] Batch {batch_id}: customer outage precheck is BYPASSED")
 
     weak_signal_policy = notification_service.get_alert_policy_status("outage", config)
     raw_weak_signal_alerts = load_weak_signal_rows(repo, batch_id)

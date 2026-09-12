@@ -1,7 +1,7 @@
 ---
 phase: 3
 title: "Verify, Gate, and Roll Out Enforcement"
-status: pending
+status: completed
 priority: P1
 effort: "1d"
 dependencies: [2]
@@ -124,11 +124,11 @@ Release stop conditions are exact: any false clear/suppress, terminal downgrade,
 
 ## Todo List
 
-- [ ] Pass Core contract/deadline/backlog/cache/security verification.
-- [ ] Pass application contract/rate/freshness/cutoff/claim/bridge verification.
-- [ ] Deploy Core first and prove the exact capability under `/usr/bin/python3`.
-- [ ] Approve all live fixture semantics without retaining raw data.
-- [ ] Deploy bypassed, enable deliberately, observe aggregates, and prove manual rollback/re-enable.
+- [x] Pass Core contract/deadline/backlog/cache/security verification.
+- [x] Pass application contract/rate/freshness/cutoff/claim/bridge verification.
+- [x] Deploy Core first and prove the exact capability under `/usr/bin/python3`.
+- [x] Approve all live fixture semantics without retaining raw data.
+- [x] Deploy bypassed, enable deliberately, observe aggregates, and prove manual rollback/re-enable.
 
 ## Validation Commands
 
@@ -191,12 +191,12 @@ Rollback is deliberate, not automatic: an authorized operator records the reason
 
 ## Success Criteria
 
-- [ ] Every deterministic/live outcome matches the tables, and only exact fresh `CLEAR/NONE` can call Telecom Zalo.
-- [ ] Hundreds-key auth/request scheduling and shutdown remain within the stated deadline bound; sequential gateway delay produces stale skips, never stale sends.
-- [ ] Same-batch anti-spam, cross-midnight retries, atomic leases, batch attribution, terminal monotonicity, and requestId defense hold under races/failures.
-- [ ] Session cache and configured secret paths pass owner/type/mode/no-follow/contention checks without revealing values.
-- [ ] All aggregate buckets are present and low-cardinality; no sentinel/raw data appears.
-- [ ] Core-first capability check, application tests, four live fixtures, controlled enable, manual bypass, and re-enable all pass with no unrelated branch delta.
+- [x] Every deterministic/live outcome matches the tables, and only exact fresh `CLEAR/NONE` can call Telecom Zalo.
+- [x] Hundreds-key auth/request scheduling and shutdown remain within the stated deadline bound; sequential gateway delay produces stale skips, never stale sends.
+- [x] Same-batch anti-spam, cross-midnight retries, atomic leases, batch attribution, terminal monotonicity, and requestId defense hold under races/failures.
+- [x] Session cache and configured secret paths pass owner/type/mode/no-follow/contention checks without revealing values.
+- [x] All aggregate buckets are present and low-cardinality; no sentinel/raw data appears.
+- [x] Core-first capability check, application tests, four live fixtures, controlled enable, manual bypass, and re-enable all pass with no unrelated branch delta.
 
 ## Next Steps
 

@@ -60,3 +60,35 @@ Bien `INDIVIDUAL_ZALO_MAPPING_FILE` tro den file JSON anh xa NVKT sang Zalo user
 
 Tin ca nhan chi gui cac ma OFF moi phat sinh trong ngay tinh tu `INDIVIDUAL_ALERT_START_TIME`; moi `subscriber_key` chi duoc thong bao mot lan trong ngay. Trang thai da gui luu trong SQLite `notification_runtime_state`, tach rieng voi luong gui nhom.
 Bien `WIDE_AREA_ALERT_EXCLUDED_PORTS` dung de loai tru cac cong khong can gui ban tin dien rong. Moi muc co dang `OLT: <ten_olt>, Port: <port>` va phan cach nhau bang dau `;`. Ban ghi canh bao van duoc luu trong DB, chi bo qua khau gui thong bao.
+
+## Canh bao khach hang & Precheck OneBSS
+
+He thong ho tro gui tin Zalo thong bao giand doan den truc tiep khach hang thong qua Telecom Zalo Gateway, duoc bao ve boi co che precheck OneBSS hai luot (two-pass gate) va lease khoa nguyen tu tren SQLite:
+
+- `ENABLE_CUSTOMER_OUTAGE_ALERT=True|False`: Bat/tat tinh nang gui tin cho khach hang (mac dinh `False`).
+- `CUSTOMER_ALERT_TIME_WINDOW=07:00-21:00`: Khung gio cho phep gui tin (ngoai khung gio se vao `quiet_hours`).
+- `CUSTOMER_ALERT_START_TIME=08:00`: Moc gio bat dau tinh thue bao OFF moi trong ngay cho lan thu dau tien.
+- `CUSTOMER_ALERT_END_TIME=16:00`: Moc gio ket thuc tinh thue bao OFF trong ngay cho lan thu dau tien.
+- `CUSTOMER_ALERT_HOTLINE=0822036382`: So hotline du phong khi khong tim thay so NVKT dia ban.
+- `TELECOM_ZALO_API_URL=http://localhost:3002`: URL dich vu Telecom Zalo API.
+- `TELECOM_ZALO_API_KEY`: API Key xac thuc voi Telecom Zalo Gateway.
+- `CUSTOMER_ALERT_MAX_PER_DAY=1`: So tin nhan toi da gui cho 1 thue bao trong 24 gio.
+- `CUSTOMER_ALERT_MAX_PER_WEEK=3`: So tin nhan toi da gui cho 1 thue bao trong 7 ngay.
+- `ENABLE_CUSTOMER_TICKET_PRECHECK=True|False`: Bat/tat precheck phieu bao hong OneBSS (mac dinh `True`).
+- `CUSTOMER_TICKET_PRECHECK_REQUEST_TIMEOUT_SECONDS=5.0`: Timeout cho moi request tra cuu OneBSS.
+- `CUSTOMER_TICKET_PRECHECK_BATCH_TIMEOUT_SECONDS=30.0`: Timeout tong cho toan bo batch precheck.
+- `CUSTOMER_TICKET_PRECHECK_MAX_WORKERS=4`: So luong worker dong thoi tra cuu OneBSS.
+- `CUSTOMER_TICKET_PRECHECK_MAX_FACT_AGE_SECONDS=60.0`: Thoi gian song toi da cua ket qua precheck truoc khi gui tin (qua thoi gian nay se danh dau `STALE` va thu lai chu ky sau).
+- `CUSTOMER_TICKET_PRECHECK_CLAIM_LEASE_SECONDS=120.0`: Thoi gian lease khoa ban ghi trong SQLite (yeu cau `>= batch_timeout + req_timeout + max_fact_age + gateway_timeout`).
+
+### Quy trinh Bypass va Kich hoat lai (Authorized Bypass Procedure)
+
+1. **Tam thoi bypass precheck:**
+   - Truong hop OneBSS gap su co keo dai can tam thoi bo qua cong precheck de gui tin truc tiep theo luong cu, can bo van hanh ghi nhan ly do vao he thong quan ly thay doi/su co.
+   - Dat bien `ENABLE_CUSTOMER_TICKET_PRECHECK=false` trong `.env` hoac moi truong.
+   - Xac nhan nhat ky khoi dong va tong ket moi chu ky batch hien thi `precheck=BYPASSED` kem canh bao `[WARNING] ... precheck is BYPASSED`.
+   - Cac ban ghi da o trang thai cuoi (`SENT`, `SKIPPED_CUSTOMER_TICKET`) van duoc giu nguyen tinh bat bien.
+2. **Kich hoat lai (Re-enable):**
+   - Sau khi OneBSS hoat dong binh thuong tro lai va kiem tra ket noi/test thanh cong, dat `ENABLE_CUSTOMER_TICKET_PRECHECK=true`.
+   - Xac nhan chu ky tiep theo ghi nhan `precheck=ENFORCED` va cac chi so precheck hoat dong day du.
+   - He thong tuyet doi khong tu dong bypass khi OneBSS loi (luon fail-closed de tranh spam khach hang).

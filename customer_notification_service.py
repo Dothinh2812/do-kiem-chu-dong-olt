@@ -1,21 +1,58 @@
-# -*- coding: utf-8 -*-
+import asyncio
 import json
 import os
 import re
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Union
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
 try:
     from .alert_db import AlertRepository
-    from .notification_service import _is_within_time_window, load_config
+    from .alert_models import CustomerOutageClaim
+    from .notification_service import (
+        _is_within_time_window,
+        _parse_hhmm,
+        _parse_strict_bool,
+        load_config,
+    )
+    from .onebss_precheck import (
+        SENDABLE_CLEAR_REASONS,
+        canonicalize_ma_tb,
+        run_customer_ticket_precheck,
+    )
 except ImportError:
     from alert_db import AlertRepository
-    from notification_service import _is_within_time_window, load_config
+    from alert_models import CustomerOutageClaim
+    from notification_service import (
+        _is_within_time_window,
+        _parse_hhmm,
+        _parse_strict_bool,
+        load_config,
+    )
+    from onebss_precheck import (
+        SENDABLE_CLEAR_REASONS,
+        canonicalize_ma_tb,
+        run_customer_ticket_precheck,
+    )
+
+try:
+    from onebss_core import (
+        IncidentClassification,
+        IncidentDecisionReason,
+        IncidentFailureKind,
+    )
+except ImportError:
+    from onebss_core import (
+        IncidentClassification,
+        IncidentDecisionReason,
+        IncidentFailureKind,
+    )
 
 DEFAULT_CUSTOMER_ALERT_HOTLINE = "0822036382"
 DEFAULT_CUSTOMER_ALERT_TIME_WINDOW = "07:00-21:00"
+DEFAULT_CUSTOMER_ALERT_START_TIME = "08:00"
+DEFAULT_CUSTOMER_ALERT_END_TIME = "16:00"
 DEFAULT_TELECOM_ZALO_API_URL = "http://localhost:3002"
 DEFAULT_CUSTOMER_ALERT_MAX_PER_DAY = 1
 DEFAULT_CUSTOMER_ALERT_MAX_PER_WEEK = 3
@@ -152,6 +189,44 @@ def format_customer_outage_message(
     )
 
 
+def get_customer_alert_cutoff(
+    config: Optional[Dict] = None,
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    active_config = config if config is not None else load_config()
+    if "customer_alert_start_time" in active_config:
+        start_time_raw = str(active_config.get("customer_alert_start_time", "") or "").strip()
+    else:
+        start_time_raw = DEFAULT_CUSTOMER_ALERT_START_TIME
+    if not start_time_raw:
+        return None
+    try:
+        start_time = _parse_hhmm(start_time_raw)
+    except ValueError:
+        return None
+    current_day = (now or datetime.now()).date()
+    return datetime.combine(current_day, start_time)
+
+
+def get_customer_alert_end_cutoff(
+    config: Optional[Dict] = None,
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    active_config = config if config is not None else load_config()
+    if "customer_alert_end_time" in active_config:
+        end_time_raw = str(active_config.get("customer_alert_end_time", "") or "").strip()
+    else:
+        end_time_raw = DEFAULT_CUSTOMER_ALERT_END_TIME
+    if not end_time_raw:
+        return None
+    try:
+        end_time = _parse_hhmm(end_time_raw)
+    except ValueError:
+        return None
+    current_day = (now or datetime.now()).date()
+    return datetime.combine(current_day, end_time)
+
+
 def check_customer_alert_eligibility(
     repo: AlertRepository,
     row: Dict,
@@ -181,6 +256,20 @@ def check_customer_alert_eligibility(
     first_off_time = row.get("first_off_time")
     if not first_off_time:
         return False, "missing_first_off_time"
+
+    fot_dt = _parse_datetime(first_off_time)
+    if fot_dt is None:
+        return False, "invalid_first_off_time"
+    if fot_dt.tzinfo is not None:
+        fot_dt = fot_dt.replace(tzinfo=None)
+
+    start_cutoff = get_customer_alert_cutoff(active_config, now=current_time)
+    if start_cutoff is not None and fot_dt < start_cutoff:
+        return False, "before_cutoff"
+
+    end_cutoff = get_customer_alert_end_cutoff(active_config, now=current_time)
+    if end_cutoff is not None and fot_dt > end_cutoff:
+        return False, "after_cutoff"
 
     # Layer 2: Idempotency per outage incident
     if repo.has_customer_outage_alert_sent(subscriber_key, first_off_time):
@@ -282,6 +371,7 @@ async def process_customer_outage_alerts(
     config: Optional[Dict] = None,
     now: Optional[datetime] = None,
     log=print,
+    core: Any = None,
 ) -> Dict:
     active_config = config or load_config()
     current_time = now or datetime.now()
@@ -294,6 +384,30 @@ async def process_customer_outage_alerts(
         "skipped": 0,
         "skipped_reasons": {},
         "deliveries": [],
+        "classification_counts": {
+            "CUSTOMER_OPEN_TICKET": 0,
+            "CLEAR": 0,
+            "INDETERMINATE": 0,
+        },
+        "failure_kind_counts": {
+            "NONE": 0,
+            "AUTH": 0,
+            "API": 0,
+            "REQUEST_TIMEOUT": 0,
+            "BATCH_TIMEOUT": 0,
+            "PARTIAL": 0,
+            "AMBIGUOUS": 0,
+            "CONTRACT": 0,
+        },
+        "onebss_checked": 0,
+        "onebss_retried": 0,
+        "onebss_stale": 0,
+        "onebss_deadline_expired": 0,
+        "onebss_request_count": 0,
+        "onebss_request_duration_ms_total": 0.0,
+        "onebss_request_duration_ms_max": 0.0,
+        "onebss_batch_duration_ms": 0.0,
+        "precheck_state": "ENFORCED",
     }
 
     if not active_config.get("enable_customer_outage_alert", False):
@@ -314,64 +428,413 @@ async def process_customer_outage_alerts(
             )
         return results
 
-    phone_mapping = load_nvkt_phone_mapping(active_config)
-
-    for row in candidate_rows:
-        subscriber_key = str(row.get("subscriber_key") or "").strip()
-        ma_tb = str(row.get("ma_tb") or "").strip()
-        first_off_time = row.get("first_off_time")
-
-        is_eligible, reason = check_customer_alert_eligibility(
-            repo, row, active_config, now=current_time
+    def _skip_row(reason: str):
+        results["skipped"] += 1
+        results["skipped_reasons"][reason] = (
+            results["skipped_reasons"].get(reason, 0) + 1
         )
-        if not is_eligible:
-            results["skipped"] += 1
-            results["skipped_reasons"][reason] = (
-                results["skipped_reasons"].get(reason, 0) + 1
-            )
+
+    # Pass 1: Local eligibility and atomic claim
+    prepared: List[Dict[str, Any]] = []
+    lease_seconds = float(
+        active_config.get("customer_ticket_precheck_claim_lease_seconds") or 120.0
+    )
+
+    for idx, row in enumerate(candidate_rows):
+        subscriber_key = str(row.get("subscriber_key") or "").strip()
+        if not subscriber_key:
+            _skip_row("missing_subscriber_key")
             continue
 
-        results["eligible"] += 1
+        raw_ma_tb = row.get("ma_tb")
+        canonical_ma = canonicalize_ma_tb(raw_ma_tb)
+        if not canonical_ma:
+            _skip_row("missing_ma_tb")
+            continue
+
+        first_off_time = row.get("first_off_time")
+        if not first_off_time:
+            _skip_row("missing_first_off_time")
+            continue
+
+        fot_dt = _parse_datetime(first_off_time)
+        if fot_dt is None:
+            _skip_row("invalid_first_off_time")
+            continue
+        if fot_dt.tzinfo is not None:
+            fot_dt = fot_dt.replace(tzinfo=None)
+
         request_id = build_customer_alert_request_id(subscriber_key, first_off_time)
-        message = format_customer_outage_message(
+
+        prior = repo.get_customer_outage_alert_disposition(request_id)
+        prior_status = prior.get("status") if prior else None
+
+        if prior_status == "SKIPPED_CUSTOMER_TICKET":
+            _skip_row("existing_customer_ticket")
+            continue
+
+        if prior_status == "SENT":
+            _skip_row("already_sent_for_incident")
+            continue
+
+        if repo.has_customer_outage_alert_sent(subscriber_key, first_off_time):
+            _skip_row("already_sent_for_incident")
+            continue
+
+        is_retry = prior_status in {"PRECHECK_FAILED", "INDETERMINATE", "STALE"}
+        if not is_retry:
+            start_cutoff = get_customer_alert_cutoff(active_config, now=current_time)
+            if start_cutoff is not None and fot_dt < start_cutoff:
+                _skip_row("before_cutoff")
+                continue
+
+            end_cutoff = get_customer_alert_end_cutoff(active_config, now=current_time)
+            if end_cutoff is not None and fot_dt > end_cutoff:
+                _skip_row("after_cutoff")
+                continue
+
+        # Preliminary rate check against persisted SENT rows
+        max_per_day = int(
+            active_config.get("customer_alert_max_per_day", DEFAULT_CUSTOMER_ALERT_MAX_PER_DAY)
+        )
+        since_24h = current_time - timedelta(hours=24)
+        if repo.count_recent_customer_outage_alerts(subscriber_key, since_24h) >= max_per_day:
+            _skip_row("daily_limit_exceeded")
+            continue
+
+        max_per_week = int(
+            active_config.get("customer_alert_max_per_week", DEFAULT_CUSTOMER_ALERT_MAX_PER_WEEK)
+        )
+        since_7d = current_time - timedelta(days=7)
+        if repo.count_recent_customer_outage_alerts(subscriber_key, since_7d) >= max_per_week:
+            _skip_row("weekly_limit_exceeded")
+            continue
+
+        claim = repo.claim_customer_outage_alert_precheck(
+            subscriber_key=subscriber_key,
+            ma_tb=canonical_ma,
+            first_off_time=first_off_time,
+            claimed_at=current_time,
+            batch_id=batch_id,
+            request_id=request_id,
+            lease_seconds=lease_seconds,
+        )
+
+        if claim.outcome == "TERMINAL":
+            if claim.prior_status == "SKIPPED_CUSTOMER_TICKET":
+                _skip_row("existing_customer_ticket")
+            else:
+                _skip_row("already_sent_for_incident")
+            continue
+        elif claim.outcome == "LEASE_HELD":
+            _skip_row("precheck_in_progress")
+            continue
+        elif claim.outcome != "CLAIMED":
+            _skip_row("claim_failed")
+            continue
+
+        prepared.append(
+            {
+                "original_index": idx,
+                "row": row,
+                "subscriber_key": subscriber_key,
+                "canonical_ma_tb": canonical_ma,
+                "first_off_time": first_off_time,
+                "fot_dt": fot_dt,
+                "request_id": request_id,
+                "claimed_at": claim.claimed_at,
+                "prior_status": claim.prior_status,
+                "prior_sent_time": claim.prior_sent_time,
+            }
+        )
+
+    # Count retried rows
+    onebss_retried = 0
+    for item in prepared:
+        if item["prior_status"] in {"PRECHECK_FAILED", "INDETERMINATE", "STALE"}:
+            onebss_retried += 1
+    results["onebss_retried"] = onebss_retried
+
+    # Sort retries first by oldest prior sent_time, then new rows by stable input order
+    def _item_sort_key(item):
+        is_ret = item["prior_status"] in {"PRECHECK_FAILED", "INDETERMINATE", "STALE"}
+        pst = item["prior_sent_time"]
+        if pst is not None and pst.tzinfo is not None:
+            pst = pst.replace(tzinfo=None)
+        prior_t = pst or datetime.min
+        return (0 if is_ret else 1, prior_t if is_ret else item["original_index"])
+
+    prepared.sort(key=_item_sort_key)
+
+    enable_precheck = _parse_strict_bool(
+        active_config.get("enable_customer_ticket_precheck", True),
+        default=True,
+        name="enable_customer_ticket_precheck",
+    )
+
+    unique_ma_tb_list = list(dict.fromkeys(item["canonical_ma_tb"] for item in prepared))
+
+    if enable_precheck:
+        results["precheck_state"] = "ENFORCED"
+        if unique_ma_tb_list:
+            precheck_result = await asyncio.to_thread(
+                run_customer_ticket_precheck,
+                unique_ma_tb_list,
+                active_config,
+                core,
+            )
+            results["onebss_checked"] = len(unique_ma_tb_list)
+            if hasattr(precheck_result, "metrics") and precheck_result.metrics:
+                m = precheck_result.metrics
+                results["onebss_request_count"] = m.request_count
+                results["onebss_request_duration_ms_total"] = m.request_duration_ms_total
+                results["onebss_request_duration_ms_max"] = m.request_duration_ms_max
+                results["onebss_batch_duration_ms"] = m.batch_duration_ms
+                results["onebss_deadline_expired"] = m.deadline_expired_count
+        else:
+            precheck_result = None
+    else:
+        results["precheck_state"] = "BYPASSED"
+        precheck_result = None
+        log(f"[WARNING] Batch {batch_id}: customer ticket precheck is BYPASSED")
+
+    # Pass 2: Sequential send loop
+    phone_mapping = load_nvkt_phone_mapping(active_config)
+    same_batch_success_counts: Dict[str, int] = {}
+    same_batch_reserved_counts: Dict[str, int] = {}
+    cycle_baseline_sent_24h: Dict[str, int] = {}
+    cycle_baseline_sent_7d: Dict[str, int] = {}
+
+    max_fact_age = float(
+        active_config.get("customer_ticket_precheck_max_fact_age_seconds") or 60.0
+    )
+
+    for item in prepared:
+        sub_key = item["subscriber_key"]
+        can_ma = item["canonical_ma_tb"]
+        req_id = item["request_id"]
+        expected_claimed = item["claimed_at"]
+        row = item["row"]
+
+        if results["precheck_state"] == "ENFORCED":
+            decision = (
+                precheck_result.decisions.get(can_ma) if precheck_result else None
+            )
+            if decision is None:
+                repo.finalize_customer_outage_alert_precheck(
+                    request_id=req_id,
+                    batch_id=batch_id,
+                    expected_claimed_at=expected_claimed,
+                    status="PRECHECK_FAILED",
+                    finalized_at=current_time,
+                    error_reason="contract_violation",
+                )
+                _skip_row("contract_violation")
+                continue
+
+            cls_val = (
+                decision.classification.value
+                if hasattr(decision.classification, "value")
+                else str(decision.classification)
+            )
+            fail_val = (
+                decision.failure_kind.value
+                if hasattr(decision.failure_kind, "value")
+                else str(decision.failure_kind)
+            )
+            if cls_val in results["classification_counts"]:
+                results["classification_counts"][cls_val] += 1
+            if fail_val in results["failure_kind_counts"]:
+                results["failure_kind_counts"][fail_val] += 1
+
+            if (
+                decision.classification == IncidentClassification.CUSTOMER_OPEN_TICKET
+                and decision.failure_kind == IncidentFailureKind.NONE
+            ):
+                repo.finalize_customer_outage_alert_precheck(
+                    request_id=req_id,
+                    batch_id=batch_id,
+                    expected_claimed_at=expected_claimed,
+                    status="SKIPPED_CUSTOMER_TICKET",
+                    finalized_at=current_time,
+                    error_reason="customer_open_ticket",
+                )
+                _skip_row("existing_customer_ticket")
+                continue
+
+            if decision.classification == IncidentClassification.INDETERMINATE:
+                if decision.failure_kind in (
+                    IncidentFailureKind.AUTH,
+                    IncidentFailureKind.API,
+                    IncidentFailureKind.REQUEST_TIMEOUT,
+                    IncidentFailureKind.BATCH_TIMEOUT,
+                    IncidentFailureKind.PARTIAL,
+                    IncidentFailureKind.CONTRACT,
+                ):
+                    final_status = "PRECHECK_FAILED"
+                    err_code = "precheck_failed"
+                else:
+                    final_status = "INDETERMINATE"
+                    err_code = "indeterminate"
+                repo.finalize_customer_outage_alert_precheck(
+                    request_id=req_id,
+                    batch_id=batch_id,
+                    expected_claimed_at=expected_claimed,
+                    status=final_status,
+                    finalized_at=current_time,
+                    error_reason=err_code,
+                )
+                _skip_row(err_code)
+                continue
+
+            if not (
+                decision.classification == IncidentClassification.CLEAR
+                and decision.failure_kind == IncidentFailureKind.NONE
+                and decision.reason in SENDABLE_CLEAR_REASONS
+            ):
+                repo.finalize_customer_outage_alert_precheck(
+                    request_id=req_id,
+                    batch_id=batch_id,
+                    expected_claimed_at=expected_claimed,
+                    status="PRECHECK_FAILED",
+                    finalized_at=current_time,
+                    error_reason="contract_violation",
+                )
+                _skip_row("contract_violation")
+                continue
+
+            now_utc = datetime.now(timezone.utc)
+            fact_age = (now_utc - decision.checked_at).total_seconds()
+            if fact_age > max_fact_age:
+                repo.finalize_customer_outage_alert_precheck(
+                    request_id=req_id,
+                    batch_id=batch_id,
+                    expected_claimed_at=expected_claimed,
+                    status="STALE",
+                    finalized_at=current_time,
+                    error_reason="onebss_stale",
+                )
+                _skip_row("onebss_stale")
+                results["onebss_stale"] += 1
+                continue
+
+        # Refresh owned claim lease
+        refreshed_at = repo.refresh_customer_outage_alert_precheck_claim(
+            request_id=req_id,
+            batch_id=batch_id,
+            expected_claimed_at=expected_claimed,
+            refreshed_at=current_time,
+        )
+        if refreshed_at is None:
+            _skip_row("lease_lost")
+            continue
+        expected_claimed = refreshed_at
+
+        # Re-query and reserve daily/weekly allowance
+        if sub_key not in cycle_baseline_sent_24h:
+            cycle_baseline_sent_24h[sub_key] = (
+                repo.count_recent_customer_outage_alerts(
+                    sub_key, current_time - timedelta(hours=24)
+                )
+            )
+            cycle_baseline_sent_7d[sub_key] = (
+                repo.count_recent_customer_outage_alerts(
+                    sub_key, current_time - timedelta(days=7)
+                )
+            )
+
+        fresh_24h = repo.count_recent_customer_outage_alerts(
+            sub_key, current_time - timedelta(hours=24)
+        )
+        fresh_7d = repo.count_recent_customer_outage_alerts(
+            sub_key, current_time - timedelta(days=7)
+        )
+        success_count = same_batch_success_counts.get(sub_key, 0)
+        reserved_count = same_batch_reserved_counts.get(sub_key, 0)
+
+        eff_24h = max(
+            fresh_24h, cycle_baseline_sent_24h[sub_key] + success_count + reserved_count
+        )
+        eff_7d = max(
+            fresh_7d, cycle_baseline_sent_7d[sub_key] + success_count + reserved_count
+        )
+
+        max_per_day = int(
+            active_config.get(
+                "customer_alert_max_per_day", DEFAULT_CUSTOMER_ALERT_MAX_PER_DAY
+            )
+        )
+        max_per_week = int(
+            active_config.get(
+                "customer_alert_max_per_week", DEFAULT_CUSTOMER_ALERT_MAX_PER_WEEK
+            )
+        )
+
+        if eff_24h >= max_per_day:
+            repo.finalize_customer_outage_alert_precheck(
+                request_id=req_id,
+                batch_id=batch_id,
+                expected_claimed_at=expected_claimed,
+                status="FAILED",
+                finalized_at=current_time,
+                error_reason="daily_limit_exceeded",
+            )
+            _skip_row("daily_limit_exceeded")
+            continue
+
+        if eff_7d >= max_per_week:
+            repo.finalize_customer_outage_alert_precheck(
+                request_id=req_id,
+                batch_id=batch_id,
+                expected_claimed_at=expected_claimed,
+                status="FAILED",
+                finalized_at=current_time,
+                error_reason="weekly_limit_exceeded",
+            )
+            _skip_row("weekly_limit_exceeded")
+            continue
+
+        # Provisional reservation
+        same_batch_reserved_counts[sub_key] = reserved_count + 1
+
+        results["eligible"] += 1
+        msg_text = format_customer_outage_message(
             row, active_config, now=current_time, phone_mapping=phone_mapping
         )
-
         delivery_result = await send_customer_outage_message(
-            ma_tb, request_id, message, active_config
+            can_ma, req_id, msg_text, active_config
         )
+        same_batch_reserved_counts[sub_key] = max(
+            0, same_batch_reserved_counts[sub_key] - 1
+        )
+
         success = delivery_result.get("success", False)
-        status = "SENT" if success else "FAILED"
-        error_reason = delivery_result.get("error")
-
-        # Record in database log
-        try:
-            repo.log_customer_outage_alert(
-                subscriber_key=subscriber_key,
-                ma_tb=ma_tb,
-                first_off_time=first_off_time,
-                sent_time=current_time,
-                batch_id=batch_id,
-                request_id=request_id,
-                status=status,
-                error_reason=error_reason,
-            )
-        except Exception as exc:
-            log(f"⚠️ Failed to log customer outage alert to db: {exc}")
-
+        err_reason = delivery_result.get("error")
         if success:
+            same_batch_success_counts[sub_key] = success_count + 1
+            status_str = "SENT"
             results["sent"] += 1
         else:
+            status_str = "FAILED"
             results["failed"] += 1
+
+        repo.finalize_customer_outage_alert_precheck(
+            request_id=req_id,
+            batch_id=batch_id,
+            expected_claimed_at=expected_claimed,
+            status=status_str,
+            finalized_at=current_time,
+            error_reason=err_reason,
+        )
 
         results["deliveries"].append(
             {
                 "batch_id": batch_id,
-                "subscriber_key": subscriber_key,
-                "ma_tb": ma_tb,
-                "request_id": request_id,
-                "status": status,
-                "error": error_reason,
+                "subscriber_key": sub_key,
+                "ma_tb": can_ma,
+                "request_id": req_id,
+                "status": status_str,
+                "error": err_reason,
                 "status_code": delivery_result.get("status_code"),
             }
         )

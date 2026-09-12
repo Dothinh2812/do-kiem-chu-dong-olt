@@ -110,3 +110,11 @@ class WideAreaAlert:
     @property
     def olt_port_key(self) -> str:
         return self.parent_port_key
+
+
+@dataclass(frozen=True)
+class CustomerOutageClaim:
+    outcome: str  # "CLAIMED" | "TERMINAL" | "LEASE_HELD"
+    prior_status: Optional[str] = None
+    claimed_at: Optional[datetime] = None
+    prior_sent_time: Optional[datetime] = None

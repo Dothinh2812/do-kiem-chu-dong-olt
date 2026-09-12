@@ -1,7 +1,7 @@
 ---
 phase: 1
 title: "Harden the OneBSS Batch Fact Contract"
-status: pending
+status: completed
 priority: P1
 effort: "1.5d"
 dependencies: []
@@ -119,20 +119,20 @@ Create `OneBSSCoreError` and safe subclasses/mappers in `/home/vtst/onebss_core/
 
 ## Todo List
 
-- [ ] Validate anonymized production status vocabulary, exact channel allowlists, explicit-empty schema, and terminal/open precedence.
-- [ ] Implement the typed private-evidence/closed-decision contract.
-- [ ] Enforce the auth-inclusive deadline and bounded scheduler.
-- [ ] Harden and contention-test the reusable session cache.
-- [ ] Document and prove no raw body, incident fact, or artifact escapes.
+- [x] Validate anonymized production status vocabulary, exact channel allowlists, explicit-empty schema, and terminal/open precedence.
+- [x] Implement the typed private-evidence/closed-decision contract.
+- [x] Enforce the auth-inclusive deadline and bounded scheduler.
+- [x] Harden and contention-test the reusable session cache.
+- [x] Document and prove no raw body, incident fact, or artifact escapes.
 
 ## Success Criteria
 
-- [ ] The decision map exactly covers canonical inputs; every malformed coverage/type/enum/time case becomes `INDETERMINATE + CONTRACT`.
-- [ ] Contradiction, schema-valid empty, terminal/open, and every reviewed/unknown proactive/customer channel case follow the tables exactly.
-- [ ] One batch authenticates/closes once; no more than `max_workers` tasks exist in flight; a hundreds-key backlog stops within the batch deadline plus at most one request-timeout shutdown margin.
-- [ ] Cache owner/type/mode/no-follow/atomicity and inter-process single-login behavior are deterministic under contention.
-- [ ] Public DTOs, errors, logs, and metrics contain only allowlisted enum/timing/count fields; sentinel raw values never survive.
-- [ ] Existing callers retain old timeout behavior when optional deadline arguments are omitted.
+- [x] The decision map exactly covers canonical inputs; every malformed coverage/type/enum/time case becomes `INDETERMINATE + CONTRACT`.
+- [x] Contradiction, schema-valid empty, terminal/open, and every reviewed/unknown proactive/customer channel case follow the tables exactly.
+- [x] One batch authenticates/closes once; no more than `max_workers` tasks exist in flight; a hundreds-key backlog stops within the batch deadline plus at most one request-timeout shutdown margin.
+- [x] Cache owner/type/mode/no-follow/atomicity and inter-process single-login behavior are deterministic under contention.
+- [x] Public DTOs, errors, logs, and metrics contain only allowlisted enum/timing/count fields; sentinel raw values never survive.
+- [x] Existing callers retain old timeout behavior when optional deadline arguments are omitted.
 
 ## Risk Assessment
 

@@ -1,7 +1,7 @@
 ---
 title: "Customer-Reported OneBSS Ticket Precheck"
 description: "Suppress customer Zalo outage messages when the same MA_TB has a conclusively open customer-reported OneBSS trouble ticket."
-status: pending
+status: complete
 priority: P1
 effort: "4d"
 issue: null
@@ -35,17 +35,17 @@ Add a customer-only gate immediately before Telecom Zalo dispatch. Cheap local e
 
 | Phase | Name | Status | Dependency |
 |---|---|---|---|
-| 1 | [Harden the OneBSS Batch Fact Contract](./phase-01-start.md) | Pending | None |
-| 2 | [Integrate the Two-Pass Customer Alert Gate](./phase-02-customer-alert-integration.md) | Pending | Phase 1 |
-| 3 | [Verify, Gate, and Roll Out Enforcement](./phase-03-verification-and-rollout.md) | Pending | Phase 2 |
+| 1 | [Harden the OneBSS Batch Fact Contract](./phase-01-start.md) | Complete | None |
+| 2 | [Integrate the Two-Pass Customer Alert Gate](./phase-02-customer-alert-integration.md) | Complete | Phase 1 |
+| 3 | [Verify, Gate, and Roll Out Enforcement](./phase-03-verification-and-rollout.md) | Complete | Phase 2 |
 
 ## Acceptance Criteria
 
-- [ ] The typed total-map contract, contradiction-first evidence rules, explicit-empty handling, exact channel allowlists, and private-fact boundary are proven with fixture-reviewed tests.
-- [ ] One authentication serves a deduplicated batch whose auth, requests, bounded in-flight scheduler, cancellation, and shutdown obey the overall deadline for a hundreds-key backlog.
-- [ ] Atomic lease/monotonic transition races, same-batch anti-spam, stale decisions, and cross-midnight retries are proven without a schema migration.
-- [ ] Aggregate classification/failure/timing/retry/stale/deadline/bypass metrics contain no identifiers or raw values.
-- [ ] Core is deployed first; `/usr/bin/python3` proves the exact new method signature/types before the application deploy and four live fixtures gate enforcement.
+- [x] The typed total-map contract, contradiction-first evidence rules, explicit-empty handling, exact channel allowlists, and private-fact boundary are proven with fixture-reviewed tests.
+- [x] One authentication serves a deduplicated batch whose auth, requests, bounded in-flight scheduler, cancellation, and shutdown obey the overall deadline for a hundreds-key backlog.
+- [x] Atomic lease/monotonic transition races, same-batch anti-spam, stale decisions, and cross-midnight retries are proven without a schema migration.
+- [x] Aggregate classification/failure/timing/retry/stale/deadline/bypass metrics contain no identifiers or raw values.
+- [x] Core is deployed first; `/usr/bin/python3` proves the exact new method signature/types before the application deploy and four live fixtures gate enforcement.
 
 ## Red Team Review
 

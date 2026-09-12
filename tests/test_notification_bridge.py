@@ -1,7 +1,7 @@
 import sqlite3
 import sys
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1543,13 +1543,14 @@ def test_dispatch_batch_notifications_customer_outage(tmp_path, monkeypatch):
     except ModuleNotFoundError:
         import notification_bridge
 
+    today_str = datetime.now().strftime("%Y-%m-%d")
     snapshot_row = {
         "subscriber_key": "HNI.BVI.BVI.OLT.AL.2.1_1-1-1:1",
         "ma_tb": "TB001",
         "ten_tb": "Nguyen Van A",
         "diachi_ld": "Dia chi 1",
         "ten_nvkt_db": "NVKT 1",
-        "first_off_time": "2026-09-11T10:00:00",
+        "first_off_time": f"{today_str}T10:00:00",
         "duration_minutes": 60,
         "suppressed_by_pattern": False,
         "suppressed_by_wide_area": False,
@@ -1569,6 +1570,7 @@ def test_dispatch_batch_notifications_customer_outage(tmp_path, monkeypatch):
             "enable_zalo": False,
             "enable_customer_outage_alert": True,
             "customer_alert_time_window": "00:00-23:59",
+            "customer_alert_start_time": "08:00",
             "telecom_zalo_api_url": "http://localhost:3002",
             "telecom_zalo_api_key": "key",
         },
@@ -1594,4 +1596,115 @@ def test_dispatch_batch_notifications_customer_outage(tmp_path, monkeypatch):
     assert "customer_outage" in results
     assert results["customer_outage"]["sent"] == 1
     assert results["customer_outage"]["eligible"] == 1
+
+
+def test_dispatch_batch_notifications_customer_outage_cutoff_filtering(tmp_path, monkeypatch):
+    measurement_db = tmp_path / "onu_measurements.db"
+    source_db = tmp_path / "database.db"
+
+    with sqlite3.connect(measurement_db) as conn:
+        conn.executescript(RAW_SCHEMA)
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE danhba (
+                sub TEXT,
+                Ma_Tb TEXT,
+                Ma_Men TEXT,
+                Ten_Tb TEXT,
+                DIACHI_LD TEXT,
+                DIENTHOAI_LH TEXT,
+                TEN_NVKT_DB TEXT,
+                DOI_VT TEXT
+            )
+            """
+        )
+
+    repo = AlertRepository(str(measurement_db), str(source_db))
+    repo.ensure_schema()
+
+    try:
+        from do_chu_dong_api import notification_bridge
+    except ModuleNotFoundError:
+        import notification_bridge
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    row_old = {
+        "subscriber_key": "SUB_OLD",
+        "ma_tb": "TB_OLD",
+        "first_off_time": f"{yesterday_str}T15:00:00",
+        "duration_minutes": 1200,
+        "suppressed_by_pattern": False,
+        "suppressed_by_wide_area": False,
+        "alert_eligible": True,
+    }
+    row_new = {
+        "subscriber_key": "SUB_NEW",
+        "ma_tb": "TB_NEW",
+        "first_off_time": f"{today_str}T09:30:00",
+        "duration_minutes": 60,
+        "suppressed_by_pattern": False,
+        "suppressed_by_wide_area": False,
+        "alert_eligible": True,
+    }
+    row_late = {
+        "subscriber_key": "SUB_LATE",
+        "ma_tb": "TB_LATE",
+        "first_off_time": f"{today_str}T17:15:00",
+        "duration_minutes": 45,
+        "suppressed_by_pattern": False,
+        "suppressed_by_wide_area": False,
+        "alert_eligible": True,
+    }
+
+    monkeypatch.setattr(
+        notification_bridge,
+        "load_current_off_snapshot_rows",
+        lambda repo, batch_id: [row_old, row_new, row_late],
+    )
+    monkeypatch.setattr(
+        notification_bridge.notification_service,
+        "load_config",
+        lambda: {
+            "enable_telegram": False,
+            "enable_zalo": False,
+            "enable_customer_outage_alert": True,
+            "customer_alert_time_window": "00:00-23:59",
+            "customer_alert_start_time": "08:00",
+            "customer_alert_end_time": "16:00",
+            "telecom_zalo_api_url": "http://localhost:3002",
+            "telecom_zalo_api_key": "key",
+        },
+    )
+
+    captured_candidates = []
+
+    async def fake_process(repo, candidate_rows, *args, **kwargs):
+        captured_candidates.extend(candidate_rows)
+        return {
+            "pending": len(candidate_rows),
+            "eligible": 1,
+            "sent": 1,
+            "failed": 0,
+            "skipped": 2,
+            "skipped_reasons": {"before_cutoff": 1, "after_cutoff": 1},
+        }
+
+    monkeypatch.setattr(
+        notification_bridge.customer_notification_service,
+        "process_customer_outage_alerts",
+        fake_process,
+    )
+
+    results = dispatch_batch_notifications(repo, "b2", log=lambda _message: None)
+    assert "customer_outage" in results
+    # All gated candidates are passed to process_customer_outage_alerts for service-owned cutoff filtering
+    assert len(captured_candidates) == 3
+    assert results["customer_outage"]["pending"] == 3
+    assert results["customer_outage"]["sent"] == 1
+    assert results["customer_outage"]["skipped"] == 2
+    assert results["customer_outage"]["skipped_reasons"]["before_cutoff"] == 1
+    assert results["customer_outage"]["skipped_reasons"]["after_cutoff"] == 1
 

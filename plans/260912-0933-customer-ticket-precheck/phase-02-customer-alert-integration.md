@@ -1,7 +1,7 @@
 ---
 phase: 2
 title: "Integrate the Two-Pass Customer Alert Gate"
-status: pending
+status: completed
 priority: P1
 effort: "1.5d"
 dependencies: [1]
@@ -203,21 +203,21 @@ All enum buckets exist with zero defaults for stable dashboards. `onebss_checked
 
 ## Todo List
 
-- [ ] Add the strict adapter/config boundary and aggregate schema.
-- [ ] Implement cutoff-aware two-pass eligibility and exact-clear/freshness/rate gates.
-- [ ] Replace unconditional persistence with lease-based monotonic compare-and-set.
-- [ ] Preserve retryable incidents across midnight and terminal immutability under races.
-- [ ] Add focused adapter/service/repository/bridge coverage and operator docs.
+- [x] Add the strict adapter/config boundary and aggregate schema.
+- [x] Implement cutoff-aware two-pass eligibility and exact-clear/freshness/rate gates.
+- [x] Replace unconditional persistence with lease-based monotonic compare-and-set.
+- [x] Preserve retryable incidents across midnight and terminal immutability under races.
+- [x] Add focused adapter/service/repository/bridge coverage and operator docs.
 
 ## Success Criteria
 
-- [ ] Only exact `CLEAR/NONE` with a sendable reason, fresh `checked_at`, owned claim, and reserved allowance sends; malformed/future values cannot reach the gateway.
-- [ ] Two same-subscriber clear incidents with `customer_alert_max_per_day=1` produce one successful gateway call, including when the first `SENT` database finalization is delayed/fails.
-- [ ] Terminal rows cannot downgrade; active claims cannot be stolen; expired/retryable claims refresh `batch_id`; stale workers fail compare-and-set in multi-connection races.
-- [ ] Prior `PRECHECK_FAILED`, `INDETERMINATE`, and `STALE` rows retry across midnight while quiet hours, first-attempt cutoff, and unrelated cutoff consumers retain current behavior.
-- [ ] Worst-case sequential gateway timeouts age later facts into retryable `STALE` without sending them.
-- [ ] Bypass produces `precheck_state=BYPASSED`, zero checked decisions, a startup/every-cycle warning, and no fabricated `CLEAR`.
-- [ ] Metrics/reasons contain only bounded enum/count/duration fields; no OneBSS identifiers, evidence, body, or exception text appears.
+- [x] Only exact `CLEAR/NONE` with a sendable reason, fresh `checked_at`, owned claim, and reserved allowance sends; malformed/future values cannot reach the gateway.
+- [x] Two same-subscriber clear incidents with `customer_alert_max_per_day=1` produce one successful gateway call, including when the first `SENT` database finalization is delayed/fails.
+- [x] Terminal rows cannot downgrade; active claims cannot be stolen; expired/retryable claims refresh `batch_id`; stale workers fail compare-and-set in multi-connection races.
+- [x] Prior `PRECHECK_FAILED`, `INDETERMINATE`, and `STALE` rows retry across midnight while quiet hours, first-attempt cutoff, and unrelated cutoff consumers retain current behavior.
+- [x] Worst-case sequential gateway timeouts age later facts into retryable `STALE` without sending them.
+- [x] Bypass produces `precheck_state=BYPASSED`, zero checked decisions, a startup/every-cycle warning, and no fabricated `CLEAR`.
+- [x] Metrics/reasons contain only bounded enum/count/duration fields; no OneBSS identifiers, evidence, body, or exception text appears.
 
 ## Risk Assessment
 

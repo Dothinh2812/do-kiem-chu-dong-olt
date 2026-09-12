@@ -1,13 +1,13 @@
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 try:
-    from .alert_models import OutageAlert, RecoveryAlert, WideAreaAlert
+    from .alert_models import CustomerOutageClaim, OutageAlert, RecoveryAlert, WideAreaAlert
 except ImportError:
-    from alert_models import OutageAlert, RecoveryAlert, WideAreaAlert
+    from alert_models import CustomerOutageClaim, OutageAlert, RecoveryAlert, WideAreaAlert
 
 
 def _dt(value):
@@ -1046,41 +1046,159 @@ class AlertRepository:
             notification_time=_dt(row["notification_time"]),
         )
 
-    def log_customer_outage_alert(
+    def get_customer_outage_alert_disposition(
+        self, request_id: str
+    ) -> Optional[Dict]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, subscriber_key, ma_tb, first_off_time, sent_time, batch_id, request_id, status, error_reason
+                FROM customer_outage_alert_log
+                WHERE request_id = ?
+                LIMIT 1
+                """,
+                (request_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def claim_customer_outage_alert_precheck(
         self,
         subscriber_key: str,
         ma_tb: str,
         first_off_time: Union[str, datetime],
-        sent_time: datetime,
-        batch_id: Optional[str],
+        claimed_at: datetime,
+        batch_id: str,
         request_id: str,
-        status: str,
-        error_reason: Optional[str] = None,
-    ) -> int:
+        lease_seconds: float,
+    ) -> CustomerOutageClaim:
+        fot_iso = _iso(first_off_time)
+        claimed_iso = _iso(claimed_at)
+        lease_cutoff = claimed_at - timedelta(seconds=float(lease_seconds))
+        lease_cutoff_iso = _iso(lease_cutoff)
+
         with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT status, sent_time FROM customer_outage_alert_log WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            prior_status = existing["status"] if existing else None
+            prior_sent_time = _dt(existing["sent_time"]) if existing and existing["sent_time"] else None
+
             cursor = conn.execute(
                 """
-                INSERT INTO customer_outage_alert_log(
+                INSERT INTO customer_outage_alert_log (
                     subscriber_key, ma_tb, first_off_time, sent_time, batch_id, request_id, status, error_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'PRECHECK_IN_PROGRESS', 'precheck_in_progress')
                 ON CONFLICT(request_id) DO UPDATE SET
-                    status = excluded.status,
+                    status = 'PRECHECK_IN_PROGRESS',
                     sent_time = excluded.sent_time,
-                    error_reason = excluded.error_reason
+                    batch_id = excluded.batch_id,
+                    error_reason = 'precheck_in_progress'
+                WHERE customer_outage_alert_log.status IN ('PRECHECK_FAILED', 'INDETERMINATE', 'STALE', 'FAILED')
+                   OR (customer_outage_alert_log.status = 'PRECHECK_IN_PROGRESS' AND customer_outage_alert_log.sent_time < ?);
                 """,
                 (
                     subscriber_key,
                     ma_tb,
-                    _iso(first_off_time),
-                    _iso(sent_time),
+                    fot_iso,
+                    claimed_iso,
                     batch_id,
                     request_id,
-                    status,
-                    error_reason,
+                    lease_cutoff_iso,
                 ),
             )
             conn.commit()
-            return cursor.lastrowid
+
+            if cursor.rowcount > 0:
+                return CustomerOutageClaim(
+                    outcome="CLAIMED",
+                    prior_status=prior_status,
+                    claimed_at=claimed_at,
+                    prior_sent_time=prior_sent_time,
+                )
+
+            current = conn.execute(
+                "SELECT status, sent_time FROM customer_outage_alert_log WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            current_status = current["status"] if current else prior_status
+            if current_status in ("SENT", "SKIPPED_CUSTOMER_TICKET"):
+                return CustomerOutageClaim(
+                    outcome="TERMINAL",
+                    prior_status=current_status,
+                    claimed_at=None,
+                    prior_sent_time=prior_sent_time,
+                )
+            return CustomerOutageClaim(
+                outcome="LEASE_HELD",
+                prior_status=current_status,
+                claimed_at=None,
+                prior_sent_time=prior_sent_time,
+            )
+
+    def refresh_customer_outage_alert_precheck_claim(
+        self,
+        request_id: str,
+        batch_id: str,
+        expected_claimed_at: datetime,
+        refreshed_at: datetime,
+    ) -> Optional[datetime]:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE customer_outage_alert_log
+                SET sent_time = ?
+                WHERE request_id = ?
+                  AND batch_id = ?
+                  AND status = 'PRECHECK_IN_PROGRESS'
+                  AND sent_time = ?
+                """,
+                (
+                    _iso(refreshed_at),
+                    request_id,
+                    batch_id,
+                    _iso(expected_claimed_at),
+                ),
+            )
+            conn.commit()
+            if cursor.rowcount > 0:
+                return refreshed_at
+            return None
+
+    def finalize_customer_outage_alert_precheck(
+        self,
+        request_id: str,
+        batch_id: str,
+        expected_claimed_at: datetime,
+        status: str,
+        finalized_at: datetime,
+        error_reason: Optional[str] = None,
+    ) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE customer_outage_alert_log
+                SET status = ?,
+                    sent_time = ?,
+                    error_reason = ?
+                WHERE request_id = ?
+                  AND batch_id = ?
+                  AND status = 'PRECHECK_IN_PROGRESS'
+                  AND sent_time = ?
+                """,
+                (
+                    status,
+                    _iso(finalized_at),
+                    error_reason,
+                    request_id,
+                    batch_id,
+                    _iso(expected_claimed_at),
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
 
     def has_customer_outage_alert_sent(
         self, subscriber_key: str, first_off_time: Union[str, datetime]
