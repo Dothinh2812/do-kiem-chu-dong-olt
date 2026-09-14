@@ -245,6 +245,34 @@ class AlertRepository:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cust_outage_sub_first_off ON customer_outage_alert_log(subscriber_key, first_off_time)"
             )
+
+            self._ensure_column(conn, "subscriber_status_state", "last_onu_sn", "TEXT")
+            self._ensure_column(conn, "subscriber_status_state", "last_soft_version", "TEXT")
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS terminal_replacement_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subscriber_key TEXT NOT NULL,
+                    ma_tb TEXT,
+                    old_onu_sn TEXT,
+                    new_onu_sn TEXT,
+                    old_soft_version TEXT,
+                    new_soft_version TEXT,
+                    changed_at DATETIME NOT NULL,
+                    batch_id TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_term_repl_ma_tb ON terminal_replacement_log(ma_tb)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_term_repl_changed_at ON terminal_replacement_log(changed_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_term_repl_sub_key ON terminal_replacement_log(subscriber_key)"
+            )
             conn.commit()
 
     def get_batch_status(self, batch_id: str) -> Optional[str]:
@@ -348,7 +376,7 @@ class AlertRepository:
             rows = conn.execute(
                 """
                 SELECT "Cổng" AS subscriber_key, batch_id, onuLastOff, onuLastOn, onuStatusStr, accountFiber,
-                       oltPowerRx, onuPowerRx, NgayDo, ThoiGianDo
+                       oltPowerRx, onuPowerRx, NgayDo, ThoiGianDo, onuSN, softVersion
                 FROM onu_measurements
                 WHERE batch_id = ?
                 ORDER BY subscriber_key
@@ -540,6 +568,8 @@ class AlertRepository:
             _iso(state.get("recovery_sent_time")),
             state.get("last_batch_id", ""),
             _iso(state.get("last_measure_time")),
+            state.get("last_onu_sn"),
+            state.get("last_soft_version"),
         )
 
     def _save_state_sql(self) -> str:
@@ -549,8 +579,8 @@ class AlertRepository:
                 doi_vt, diachi_ld, dienthoai_lh, ten_nvkt_db, account_fiber,
                 current_state, last_status, consecutive_on_count, consecutive_off_count,
                 first_on_time, first_off_time, alert_sent_time, recovery_sent_time,
-                last_batch_id, last_measure_time, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                last_batch_id, last_measure_time, last_onu_sn, last_soft_version, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(subscriber_key) DO UPDATE SET
                 parent_port_key = excluded.parent_port_key,
                 ma_tb = excluded.ma_tb,
@@ -572,6 +602,8 @@ class AlertRepository:
                 recovery_sent_time = excluded.recovery_sent_time,
                 last_batch_id = excluded.last_batch_id,
                 last_measure_time = excluded.last_measure_time,
+                last_onu_sn = excluded.last_onu_sn,
+                last_soft_version = excluded.last_soft_version,
                 updated_at = CURRENT_TIMESTAMP
             """
 
@@ -587,6 +619,33 @@ class AlertRepository:
             conn.executemany(
                 self._save_state_sql(),
                 [self._state_params(state) for state in states],
+            )
+            conn.commit()
+
+    def insert_terminal_replacements(self, logs: Sequence[Dict]):
+        if not logs:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO terminal_replacement_log (
+                    subscriber_key, ma_tb, old_onu_sn, new_onu_sn,
+                    old_soft_version, new_soft_version, changed_at, batch_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        log["subscriber_key"],
+                        log.get("ma_tb"),
+                        log.get("old_onu_sn"),
+                        log.get("new_onu_sn"),
+                        log.get("old_soft_version"),
+                        log.get("new_soft_version"),
+                        _iso(log.get("changed_at")),
+                        log.get("batch_id"),
+                    )
+                    for log in logs
+                ]
             )
             conn.commit()
 

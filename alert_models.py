@@ -28,6 +28,8 @@ class SubscriberSnapshot:
     ten_nvkt_db: str = ""
     account_fiber: str = ""
     onu_last_off: str = ""
+    onu_sn: str = ""
+    soft_version: str = ""
     onu_last_on: str = ""
 
     @property

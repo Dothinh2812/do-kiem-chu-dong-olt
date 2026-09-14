@@ -71,6 +71,19 @@ def _emit(log, message: str):
         log(message)
 
 
+def _is_valid_onu_sn(sn: str) -> bool:
+    if not sn:
+        return False
+    sn = sn.strip()
+    if len(sn) < 6:
+        return False
+    if set(sn) <= {'0', 'f', 'F', '-', ' '}:
+        return False
+    if sn.upper() in {"N/A", "NULL", "NONE", "UNKNOWN"}:
+        return False
+    return True
+
+
 def normalize_status(raw_status, olt_power_rx=None) -> str:
     status = str(raw_status or "").upper()
     if status == "PORT_DOWN":
@@ -125,6 +138,8 @@ def _snapshot_from_row(row: Dict, metadata: Dict) -> SubscriberSnapshot:
         account_fiber=(row.get("accountFiber") or "").strip(),
         onu_last_off=(row.get("onuLastOff") or "").strip(),
         onu_last_on=(row.get("onuLastOn") or "").strip(),
+        onu_sn=(row.get("onuSN") or "").strip(),
+        soft_version=(row.get("softVersion") or "").strip(),
     )
 
 
@@ -178,6 +193,8 @@ def _base_state(snapshot: SubscriberSnapshot, current_state: str, last_status: s
         "recovery_sent_time": recovery_sent_time,
         "last_batch_id": snapshot.batch_id,
         "last_measure_time": snapshot.measured_at,
+        "last_onu_sn": snapshot.onu_sn,
+        "last_soft_version": snapshot.soft_version,
     }
 
 
@@ -518,12 +535,36 @@ def process_completed_batch(
     states_to_save = []
     outage_alerts_to_insert = []
     recovery_alerts_to_insert = []
+    terminal_replacements = []
     for idx, snapshot in enumerate(snapshots, start=1):
         if snapshot.status == "UNKNOWN":
             unknown_count += 1
             continue
         prev = previous_state_rows.get(snapshot.subscriber_key)
         next_state, outage, recovery = _transition(snapshot, prev)
+        
+        curr_sn = snapshot.onu_sn
+        curr_sv = snapshot.soft_version
+        valid_curr_sn = _is_valid_onu_sn(curr_sn)
+        if prev:
+            prev_sn = prev.get("last_onu_sn")
+            prev_sv = prev.get("last_soft_version")
+            if _is_valid_onu_sn(prev_sn) and valid_curr_sn and prev_sn != curr_sn:
+                terminal_replacements.append({
+                    "subscriber_key": snapshot.subscriber_key,
+                    "ma_tb": snapshot.ma_tb,
+                    "old_onu_sn": prev_sn,
+                    "new_onu_sn": curr_sn,
+                    "old_soft_version": prev_sv,
+                    "new_soft_version": curr_sv,
+                    "changed_at": snapshot.measured_at,
+                    "batch_id": snapshot.batch_id,
+                })
+            
+            if not valid_curr_sn and prev_sn:
+                next_state["last_onu_sn"] = prev_sn
+                next_state["last_soft_version"] = prev_sv
+
         states_to_save.append(next_state)
         next_state_rows[snapshot.subscriber_key] = next_state
         processed_count += 1
@@ -545,6 +586,8 @@ def process_completed_batch(
         outage_alerts_to_insert,
         recovery_alerts_to_insert,
     )
+    if terminal_replacements:
+        repo.insert_terminal_replacements(terminal_replacements)
 
     _emit(
         log,
