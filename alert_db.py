@@ -1215,15 +1215,30 @@ class AlertRepository:
             return bool(row)
 
     def count_recent_customer_outage_alerts(
-        self, subscriber_key: str, since: datetime
+        self, key: str, since: datetime, by_ma_tb: bool = False
     ) -> int:
         with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(*) as cnt FROM customer_outage_alert_log
-                WHERE subscriber_key = ? AND sent_time >= ? AND status = 'SENT'
-                """,
-                (subscriber_key, _iso(since)),
-            ).fetchone()
+            if by_ma_tb:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) as cnt FROM customer_outage_alert_log
+                    WHERE LOWER(ma_tb) = LOWER(?) AND sent_time >= ? AND status = 'SENT'
+                    """,
+                    (key, _iso(since)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) as cnt FROM customer_outage_alert_log
+                    WHERE subscriber_key = ? AND sent_time >= ? AND status = 'SENT'
+                    """,
+                    (key, _iso(since)),
+                ).fetchone()
             return int(row["cnt"]) if row else 0
+
+    def count_recent_customer_outage_alerts_by_ma_tb(
+        self, ma_tb: str, since: datetime
+    ) -> int:
+        return self.count_recent_customer_outage_alerts(ma_tb, since, by_ma_tb=True)
+
 

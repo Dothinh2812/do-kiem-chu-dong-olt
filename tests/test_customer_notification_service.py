@@ -1007,3 +1007,239 @@ def test_process_customer_outage_alerts_explicit_bypass(temp_repo):
         assert summary["precheck_state"] == "BYPASSED"
         assert summary["onebss_checked"] == 0
         mock_core.lookup_open_incident_facts_batch.assert_not_called()
+
+
+def test_different_subscriber_key_same_ma_tb_rate_limit(temp_repo):
+    """Verifies that anti-spam rate limiting keys on ma_tb across different subscriber_keys."""
+    config = {
+        "enable_customer_outage_alert": True,
+        "customer_alert_time_window": "07:00-21:00",
+        "customer_alert_max_per_day": 1,
+        "customer_alert_max_per_week": 3,
+        "telecom_zalo_api_url": "http://localhost:3002",
+        "telecom_zalo_api_key": "test_key",
+    }
+    now = datetime(2026, 9, 11, 10, 0, 0)
+    candidates = [
+        {
+            "subscriber_key": "OLT1_1_1:1",
+            "ma_tb": "HNIF_SAME_ACC",
+            "first_off_time": "2026-09-11T08:30:00",
+        },
+        {
+            "subscriber_key": "OLT2_2_2:2",
+            "ma_tb": "hnif_same_acc",  # lower-case variant
+            "first_off_time": "2026-09-11T08:35:00",
+        },
+    ]
+
+    mock_core = MagicMock()
+    mock_core.lookup_open_incident_facts_batch.return_value = IncidentPrecheckBatchResult(
+        decisions={
+            "hnif_same_acc": IncidentPrecheckDecision(
+                classification=IncidentClassification.CLEAR,
+                failure_kind=IncidentFailureKind.NONE,
+                reason=IncidentDecisionReason.NO_INCIDENTS_CONFIRMED,
+                checked_at=datetime.now(timezone.utc),
+            )
+        },
+        metrics=IncidentPrecheckBatchMetrics(1, 1, 1, 10.0, 10.0, 10.0, 0),
+    )
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 202
+    mock_resp.json.return_value = {"status": "queued"}
+
+    with patch("requests.post", return_value=mock_resp) as mock_post:
+        summary = asyncio.run(
+            process_customer_outage_alerts(
+                temp_repo, candidates, "batch_cross_sub", config=config, now=now, core=mock_core
+            )
+        )
+        assert summary["sent"] == 1
+        assert summary["skipped"] == 1
+        assert summary["skipped_reasons"]["daily_limit_exceeded"] == 1
+        assert mock_post.call_count == 1
+
+        disp1 = temp_repo.get_customer_outage_alert_disposition(
+            build_customer_alert_request_id("OLT1_1_1:1", "2026-09-11T08:30:00")
+        )
+        assert disp1["status"] == "SENT"
+
+        disp2 = temp_repo.get_customer_outage_alert_disposition(
+            build_customer_alert_request_id("OLT2_2_2:2", "2026-09-11T08:35:00")
+        )
+        assert disp2["status"] == "FAILED"
+        assert disp2["error_reason"] == "daily_limit_exceeded"
+
+
+def test_process_customer_outage_alerts_cas_failure_handling(temp_repo):
+    """Verifies that if compare-and-set finalization fails (e.g. lease stolen), stats handle it."""
+    config = {
+        "enable_customer_outage_alert": True,
+        "customer_alert_time_window": "07:00-21:00",
+        "telecom_zalo_api_url": "http://localhost:3002",
+        "telecom_zalo_api_key": "test_key",
+    }
+    now = datetime(2026, 9, 11, 10, 0, 0)
+    candidates = [
+        {
+            "subscriber_key": "SUB_CAS",
+            "ma_tb": "TB_CAS",
+            "first_off_time": "2026-09-11T09:00:00",
+        }
+    ]
+
+    mock_core = MagicMock()
+    mock_core.lookup_open_incident_facts_batch.return_value = IncidentPrecheckBatchResult(
+        decisions={
+            "tb_cas": IncidentPrecheckDecision(
+                classification=IncidentClassification.CLEAR,
+                failure_kind=IncidentFailureKind.NONE,
+                reason=IncidentDecisionReason.NO_INCIDENTS_CONFIRMED,
+                checked_at=datetime.now(timezone.utc),
+            )
+        },
+        metrics=IncidentPrecheckBatchMetrics(1, 1, 1, 10.0, 10.0, 10.0, 0),
+    )
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 202
+    mock_resp.json.return_value = {"status": "queued"}
+
+    # Mock finalize_customer_outage_alert_precheck to return False (CAS conflict)
+    with patch("requests.post", return_value=mock_resp), \
+         patch.object(temp_repo, "finalize_customer_outage_alert_precheck", return_value=False):
+        summary = asyncio.run(
+            process_customer_outage_alerts(
+                temp_repo, candidates, "batch_cas", config=config, now=now, core=mock_core
+            )
+        )
+        # When CAS fails, sent is 0 and failed is 1
+        assert summary["sent"] == 0
+        assert summary["failed"] == 1
+
+
+def test_retry_outage_older_than_24h_is_skipped_and_marked_failed(temp_repo):
+    """Verifies that an in-flight retry older than 24h is skipped and finalized as FAILED."""
+    now = datetime(2026, 9, 12, 16, 0, 0)
+    fot_old = "2026-09-11T08:00:00"  # 32 hours ago (> 24 hours)
+
+    config = {
+        "enable_customer_outage_alert": True,
+        "customer_alert_time_window": "07:00-21:00",
+        "customer_alert_start_time": "08:00",
+        "customer_alert_end_time": "18:00",
+        "customer_alert_max_retry_age_hours": 24.0,
+        "telecom_zalo_api_url": "http://localhost:3002",
+        "telecom_zalo_api_key": "test_key",
+    }
+
+    req_id = build_customer_alert_request_id("SUB_ANCIENT", fot_old)
+    c_seed = temp_repo.claim_customer_outage_alert_precheck(
+        subscriber_key="SUB_ANCIENT",
+        ma_tb="TB_ANCIENT",
+        first_off_time=fot_old,
+        claimed_at=datetime(2026, 9, 11, 10, 0, 0),
+        batch_id="b_old",
+        request_id=req_id,
+        lease_seconds=120,
+    )
+    temp_repo.finalize_customer_outage_alert_precheck(
+        request_id=req_id,
+        batch_id="b_old",
+        expected_claimed_at=c_seed.claimed_at,
+        status="PRECHECK_FAILED",
+        finalized_at=datetime(2026, 9, 11, 10, 0, 0),
+        error_reason="precheck_failed",
+    )
+
+    candidates = [
+        {
+            "subscriber_key": "SUB_ANCIENT",
+            "ma_tb": "TB_ANCIENT",
+            "first_off_time": fot_old,
+        }
+    ]
+
+    mock_core = MagicMock()
+    summary = asyncio.run(
+        process_customer_outage_alerts(
+            temp_repo, candidates, "batch_ancient", config=config, now=now, core=mock_core
+        )
+    )
+    assert summary["sent"] == 0
+    assert summary["skipped"] == 1
+    assert summary["skipped_reasons"]["outage_too_old"] == 1
+    mock_core.lookup_open_incident_facts_batch.assert_not_called()
+
+    disp = temp_repo.get_customer_outage_alert_disposition(req_id)
+    assert disp["status"] == "FAILED"
+    assert disp["error_reason"] == "outage_too_old"
+
+    # Second cycle: verify it skips immediately on prior error_reason='outage_too_old'
+    summary2 = asyncio.run(
+        process_customer_outage_alerts(
+            temp_repo, candidates, "batch_ancient_2", config=config, now=now, core=mock_core
+        )
+    )
+    assert summary2["skipped"] == 1
+    assert summary2["skipped_reasons"]["outage_too_old"] == 1
+
+
+def test_invalid_time_window_fails_closed_for_customer_alerts(temp_repo):
+    """Verifies that an invalid time window string fails closed (blocks sends) for customer alerts."""
+    config = {
+        "enable_customer_outage_alert": True,
+        "customer_alert_time_window": "invalid-garbage-window",
+        "customer_alert_start_time": "08:00",
+        "customer_alert_end_time": "18:00",
+    }
+    now = datetime(2026, 9, 11, 10, 0, 0)
+    candidates = [
+        {
+            "subscriber_key": "SUB_WINDOW",
+            "ma_tb": "TB_WINDOW",
+            "first_off_time": "2026-09-11T09:00:00",
+        }
+    ]
+
+    # Check eligibility function
+    eligible, reason = check_customer_alert_eligibility(
+        temp_repo, candidates[0], config=config, now=now
+    )
+    assert eligible is False
+    assert reason == "quiet_hours"
+
+    # Check process loop
+    summary = asyncio.run(
+        process_customer_outage_alerts(
+            temp_repo, candidates, "batch_win", config=config, now=now
+        )
+    )
+    assert summary["sent"] == 0
+    assert summary["skipped"] == 1
+    assert summary["skipped_reasons"]["quiet_hours"] == 1
+
+
+def test_send_customer_outage_message_async_thread_offload():
+    """Verifies send_customer_outage_message executes HTTP call without blocking the event loop."""
+    config = {
+        "telecom_zalo_api_url": "http://localhost:3002",
+        "telecom_zalo_api_key": "test_key",
+        "customer_alert_send_timeout_seconds": 5.0,
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"status": "ok"}
+
+    with patch("requests.post", return_value=mock_resp) as mock_post:
+        res = asyncio.run(
+            send_customer_outage_message("tb001", "req001", "Outage message", config=config)
+        )
+        assert res["success"] is True
+        assert res["status"] == "SENT"
+        assert mock_post.call_count == 1
+
+

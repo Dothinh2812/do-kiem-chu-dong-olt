@@ -317,7 +317,7 @@ def _parse_hhmm(value: str) -> dt_time:
     return dt_time(hour=hour, minute=minute)
 
 
-def _is_within_time_window(window: str, now: Optional[datetime] = None) -> bool:
+def _is_within_time_window(window: str, now: Optional[datetime] = None, fail_closed: bool = False) -> bool:
     normalized_window = str(window or "").strip()
     if not normalized_window:
         return True
@@ -327,6 +327,9 @@ def _is_within_time_window(window: str, now: Optional[datetime] = None) -> bool:
         start_time = _parse_hhmm(start_raw)
         end_time = _parse_hhmm(end_raw)
     except ValueError:
+        if fail_closed:
+            print(f"⚠️ Invalid notification time window '{normalized_window}', blocking send (fail-closed).")
+            return False
         print(f"⚠️ Invalid notification time window '{normalized_window}', allowing send.")
         return True
 

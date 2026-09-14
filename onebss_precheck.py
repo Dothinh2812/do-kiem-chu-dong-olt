@@ -48,7 +48,7 @@ SENDABLE_CLEAR_REASONS = {
 
 
 def canonicalize_ma_tb(ma_tb: Any) -> str:
-    return str(ma_tb or "").strip()
+    return str(ma_tb or "").strip().lower()
 
 
 def _make_contract_decision(checked_at: Optional[datetime] = None) -> IncidentPrecheckDecision:
@@ -367,8 +367,16 @@ def run_customer_ticket_precheck(
         decisions = {k: _make_contract_decision(now_utc) for k in clean_keys}
         return IncidentPrecheckBatchResult(decisions=decisions, metrics=safe_metrics)
 
+    # Normalize returned keys using canonicalize_ma_tb
+    norm_decisions: Dict[str, Any] = {}
+    for rk, rdec in raw_decisions.items():
+        if isinstance(rk, str):
+            norm_decisions[canonicalize_ma_tb(rk)] = rdec
+        else:
+            norm_decisions[rk] = rdec
+
     requested_set = set(clean_keys)
-    returned_keys = set(raw_decisions.keys())
+    returned_keys = set(norm_decisions.keys())
 
     # Any extra key invalidates all requested decisions as contract failures
     extra_keys = returned_keys - requested_set
@@ -385,10 +393,10 @@ def run_customer_ticket_precheck(
     # Validate each requested key
     validated_decisions: Dict[str, IncidentPrecheckDecision] = {}
     for k in clean_keys:
-        if k not in raw_decisions:
+        if k not in norm_decisions:
             validated_decisions[k] = _make_contract_decision(now_utc)
         else:
-            decision = raw_decisions[k]
+            decision = norm_decisions[k]
             if not _is_valid_decision(decision, now_utc):
                 validated_decisions[k] = _make_contract_decision(now_utc)
             else:

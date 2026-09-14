@@ -242,7 +242,7 @@ def check_customer_alert_eligibility(
     time_window = active_config.get(
         "customer_alert_time_window", DEFAULT_CUSTOMER_ALERT_TIME_WINDOW
     )
-    if not _is_within_time_window(time_window, current_time):
+    if not _is_within_time_window(time_window, current_time, fail_closed=True):
         return False, "quiet_hours"
 
     ma_tb = str(row.get("ma_tb") or "").strip()
@@ -271,16 +271,24 @@ def check_customer_alert_eligibility(
     if end_cutoff is not None and fot_dt > end_cutoff:
         return False, "after_cutoff"
 
+    max_retry_age_hours = float(
+        active_config.get("customer_alert_max_retry_age_hours") or 24.0
+    )
+    if (current_time - fot_dt).total_seconds() > max_retry_age_hours * 3600:
+        return False, "outage_too_old"
+
     # Layer 2: Idempotency per outage incident
     if repo.has_customer_outage_alert_sent(subscriber_key, first_off_time):
         return False, "already_sent_for_incident"
+
+    can_ma = canonicalize_ma_tb(ma_tb)
 
     # Layer 3: Daily limit
     max_per_day = int(
         active_config.get("customer_alert_max_per_day", DEFAULT_CUSTOMER_ALERT_MAX_PER_DAY)
     )
     since_24h = current_time - timedelta(hours=24)
-    if repo.count_recent_customer_outage_alerts(subscriber_key, since_24h) >= max_per_day:
+    if repo.count_recent_customer_outage_alerts(can_ma, since_24h, by_ma_tb=True) >= max_per_day:
         return False, "daily_limit_exceeded"
 
     # Layer 4: Weekly limit
@@ -288,7 +296,7 @@ def check_customer_alert_eligibility(
         active_config.get("customer_alert_max_per_week", DEFAULT_CUSTOMER_ALERT_MAX_PER_WEEK)
     )
     since_7d = current_time - timedelta(days=7)
-    if repo.count_recent_customer_outage_alerts(subscriber_key, since_7d) >= max_per_week:
+    if repo.count_recent_customer_outage_alerts(can_ma, since_7d, by_ma_tb=True) >= max_per_week:
         return False, "weekly_limit_exceeded"
 
     return True, "eligible"
@@ -321,8 +329,11 @@ async def send_customer_outage_message(
         "content": content,
     }
 
+    def _do_post():
+        return requests.post(url, json=payload, headers=headers, timeout=timeout)
+
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        resp = await asyncio.to_thread(_do_post)
         status_code = resp.status_code
         if status_code in (200, 201, 202):
             try:
@@ -418,7 +429,7 @@ async def process_customer_outage_alerts(
     time_window = active_config.get(
         "customer_alert_time_window", DEFAULT_CUSTOMER_ALERT_TIME_WINDOW
     )
-    if not _is_within_time_window(time_window, current_time):
+    if not _is_within_time_window(time_window, current_time, fail_closed=True):
         results["skipped"] = len(candidate_rows)
         results["skipped_reasons"]["quiet_hours"] = len(candidate_rows)
         if candidate_rows:
@@ -477,11 +488,43 @@ async def process_customer_outage_alerts(
             _skip_row("already_sent_for_incident")
             continue
 
+        if prior_status == "FAILED" and prior.get("error_reason") == "outage_too_old":
+            _skip_row("outage_too_old")
+            continue
+
         if repo.has_customer_outage_alert_sent(subscriber_key, first_off_time):
             _skip_row("already_sent_for_incident")
             continue
 
         is_retry = prior_status in {"PRECHECK_FAILED", "INDETERMINATE", "STALE"}
+
+        # Outage aging cutoff: reject if older than customer_alert_max_retry_age_hours
+        max_retry_age_hours = float(
+            active_config.get("customer_alert_max_retry_age_hours") or 24.0
+        )
+        if (current_time - fot_dt).total_seconds() > max_retry_age_hours * 3600:
+            _skip_row("outage_too_old")
+            if is_retry:
+                claim = repo.claim_customer_outage_alert_precheck(
+                    subscriber_key=subscriber_key,
+                    ma_tb=canonical_ma,
+                    first_off_time=first_off_time,
+                    claimed_at=current_time,
+                    batch_id=batch_id,
+                    request_id=request_id,
+                    lease_seconds=lease_seconds,
+                )
+                if claim.outcome == "CLAIMED":
+                    repo.finalize_customer_outage_alert_precheck(
+                        request_id=request_id,
+                        batch_id=batch_id,
+                        expected_claimed_at=claim.claimed_at,
+                        status="FAILED",
+                        finalized_at=current_time,
+                        error_reason="outage_too_old",
+                    )
+            continue
+
         if not is_retry:
             start_cutoff = get_customer_alert_cutoff(active_config, now=current_time)
             if start_cutoff is not None and fot_dt < start_cutoff:
@@ -493,12 +536,12 @@ async def process_customer_outage_alerts(
                 _skip_row("after_cutoff")
                 continue
 
-        # Preliminary rate check against persisted SENT rows
+        # Preliminary rate check against persisted SENT rows by customer account (ma_tb)
         max_per_day = int(
             active_config.get("customer_alert_max_per_day", DEFAULT_CUSTOMER_ALERT_MAX_PER_DAY)
         )
         since_24h = current_time - timedelta(hours=24)
-        if repo.count_recent_customer_outage_alerts(subscriber_key, since_24h) >= max_per_day:
+        if repo.count_recent_customer_outage_alerts(canonical_ma, since_24h, by_ma_tb=True) >= max_per_day:
             _skip_row("daily_limit_exceeded")
             continue
 
@@ -506,7 +549,7 @@ async def process_customer_outage_alerts(
             active_config.get("customer_alert_max_per_week", DEFAULT_CUSTOMER_ALERT_MAX_PER_WEEK)
         )
         since_7d = current_time - timedelta(days=7)
-        if repo.count_recent_customer_outage_alerts(subscriber_key, since_7d) >= max_per_week:
+        if repo.count_recent_customer_outage_alerts(canonical_ma, since_7d, by_ma_tb=True) >= max_per_week:
             _skip_row("weekly_limit_exceeded")
             continue
 
@@ -718,45 +761,46 @@ async def process_customer_outage_alerts(
                 results["onebss_stale"] += 1
                 continue
 
-        # Refresh owned claim lease
+        # Refresh owned claim lease using fresh timestamp
+        now_refresh = datetime.now()
         refreshed_at = repo.refresh_customer_outage_alert_precheck_claim(
             request_id=req_id,
             batch_id=batch_id,
             expected_claimed_at=expected_claimed,
-            refreshed_at=current_time,
+            refreshed_at=now_refresh,
         )
         if refreshed_at is None:
             _skip_row("lease_lost")
             continue
         expected_claimed = refreshed_at
 
-        # Re-query and reserve daily/weekly allowance
-        if sub_key not in cycle_baseline_sent_24h:
-            cycle_baseline_sent_24h[sub_key] = (
+        # Re-query and reserve daily/weekly allowance by customer account (can_ma)
+        if can_ma not in cycle_baseline_sent_24h:
+            cycle_baseline_sent_24h[can_ma] = (
                 repo.count_recent_customer_outage_alerts(
-                    sub_key, current_time - timedelta(hours=24)
+                    can_ma, current_time - timedelta(hours=24), by_ma_tb=True
                 )
             )
-            cycle_baseline_sent_7d[sub_key] = (
+            cycle_baseline_sent_7d[can_ma] = (
                 repo.count_recent_customer_outage_alerts(
-                    sub_key, current_time - timedelta(days=7)
+                    can_ma, current_time - timedelta(days=7), by_ma_tb=True
                 )
             )
 
         fresh_24h = repo.count_recent_customer_outage_alerts(
-            sub_key, current_time - timedelta(hours=24)
+            can_ma, current_time - timedelta(hours=24), by_ma_tb=True
         )
         fresh_7d = repo.count_recent_customer_outage_alerts(
-            sub_key, current_time - timedelta(days=7)
+            can_ma, current_time - timedelta(days=7), by_ma_tb=True
         )
-        success_count = same_batch_success_counts.get(sub_key, 0)
-        reserved_count = same_batch_reserved_counts.get(sub_key, 0)
+        success_count = same_batch_success_counts.get(can_ma, 0)
+        reserved_count = same_batch_reserved_counts.get(can_ma, 0)
 
         eff_24h = max(
-            fresh_24h, cycle_baseline_sent_24h[sub_key] + success_count + reserved_count
+            fresh_24h, cycle_baseline_sent_24h[can_ma] + success_count + reserved_count
         )
         eff_7d = max(
-            fresh_7d, cycle_baseline_sent_7d[sub_key] + success_count + reserved_count
+            fresh_7d, cycle_baseline_sent_7d[can_ma] + success_count + reserved_count
         )
 
         max_per_day = int(
@@ -776,7 +820,7 @@ async def process_customer_outage_alerts(
                 batch_id=batch_id,
                 expected_claimed_at=expected_claimed,
                 status="FAILED",
-                finalized_at=current_time,
+                finalized_at=datetime.now(),
                 error_reason="daily_limit_exceeded",
             )
             _skip_row("daily_limit_exceeded")
@@ -788,14 +832,14 @@ async def process_customer_outage_alerts(
                 batch_id=batch_id,
                 expected_claimed_at=expected_claimed,
                 status="FAILED",
-                finalized_at=current_time,
+                finalized_at=datetime.now(),
                 error_reason="weekly_limit_exceeded",
             )
             _skip_row("weekly_limit_exceeded")
             continue
 
         # Provisional reservation
-        same_batch_reserved_counts[sub_key] = reserved_count + 1
+        same_batch_reserved_counts[can_ma] = reserved_count + 1
 
         results["eligible"] += 1
         msg_text = format_customer_outage_message(
@@ -804,28 +848,35 @@ async def process_customer_outage_alerts(
         delivery_result = await send_customer_outage_message(
             can_ma, req_id, msg_text, active_config
         )
-        same_batch_reserved_counts[sub_key] = max(
-            0, same_batch_reserved_counts[sub_key] - 1
+        same_batch_reserved_counts[can_ma] = max(
+            0, same_batch_reserved_counts[can_ma] - 1
         )
 
         success = delivery_result.get("success", False)
         err_reason = delivery_result.get("error")
         if success:
-            same_batch_success_counts[sub_key] = success_count + 1
+            same_batch_success_counts[can_ma] = success_count + 1
             status_str = "SENT"
             results["sent"] += 1
         else:
             status_str = "FAILED"
             results["failed"] += 1
 
-        repo.finalize_customer_outage_alert_precheck(
+        finalized_ok = repo.finalize_customer_outage_alert_precheck(
             request_id=req_id,
             batch_id=batch_id,
             expected_claimed_at=expected_claimed,
             status=status_str,
-            finalized_at=current_time,
+            finalized_at=datetime.now(),
             error_reason=err_reason,
         )
+        if not finalized_ok:
+            log(f"[WARNING] Batch {batch_id}: CAS finalize failed for {req_id} (claim lease stolen or state conflict)")
+            if success:
+                results["sent"] = max(0, results["sent"] - 1)
+                results["failed"] += 1
+                status_str = "FAILED"
+                err_reason = "cas_conflict"
 
         results["deliveries"].append(
             {
